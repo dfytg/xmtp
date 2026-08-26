@@ -12,6 +12,6 @@ One file per `xmtp-sys` / `xmtp-ffi` version, named `{version}` (no extension). 
 
 Two spaces between digest and filename. Binary mode (`<hash> *<name>`) is also accepted.
 
-`build.rs` reads `sha256sums/{CARGO_PKG_VERSION}`. If that file is absent, checksum verification is skipped (`cargo:warning`). If it is present, a missing or mismatched hash for the current target asset fails the build.
+`build.rs` reads `sha256sums/{XMTP_FFI_VERSION or CARGO_PKG_VERSION}`. If that file is absent, checksum verification is skipped (`cargo:warning`). If it is present, a missing or mismatched hash for the current target asset fails the build.
 
 Do not add a map for `0.1.11`. Hashes for `0.2.0` are committed with the `ffi-v0.2.0` release.

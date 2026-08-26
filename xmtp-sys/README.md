@@ -21,7 +21,7 @@ At build time, the build script:
 Committed files under [`sha256sums/`](sha256sums/) use GNU `sha256sum` format (64 hex digits, two spaces, GitHub Release asset filename). `build.rs` looks up `sha256sums/{CARGO_PKG_VERSION}` (or `XMTP_FFI_VERSION` when set).
 
 - **No file for this version** (current `0.1.11`): skip verification and emit `cargo:warning`.
-- **File present:** fail the build if the current target asset is missing from the map or the digest does not match.
+- **File present:** fail the build if the current target asset is missing from the map or the digest does not match. Incremental rebuilds reuse `OUT_DIR/lib` only when `archive.sha256` matches that digest.
 - **`XMTP_FFI_DIR`:** skips download and checksums (local staticlib).
 - There is no checksum-skip environment variable for download builds.
 

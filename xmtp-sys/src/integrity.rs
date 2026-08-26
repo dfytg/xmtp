@@ -49,7 +49,26 @@ fn parse_gnu_sha256sum_line(line: &str) -> Option<(String, &str)> {
     Some((hash.to_ascii_lowercase(), name))
 }
 
+/// Whether a previously extracted lib can be reused.
+///
+/// No map (`expected_hex` is `None`): `lib_exists` is enough.
+/// Map present: the stamp must equal the map digest (missing/mismatch → re-download).
+pub(crate) fn cached_extract_is_fresh(
+    lib_exists: bool,
+    expected_hex: Option<&str>,
+    stamp: Option<&str>,
+) -> bool {
+    if !lib_exists {
+        return false;
+    }
+    let Some(expected) = expected_hex else {
+        return true;
+    };
+    stamp.is_some_and(|s| s.trim().eq_ignore_ascii_case(expected))
+}
+
 /// Fail-closed: the map must contain `asset` and the digest must match.
+#[cfg(test)]
 pub(crate) fn verify_asset_hash(
     map: &BTreeMap<String, String>,
     asset: &str,
@@ -58,8 +77,14 @@ pub(crate) fn verify_asset_hash(
     let Some(expected) = map.get(asset) else {
         return Err(format!("SHA-256 map has no hash for asset {asset}"));
     };
+    verify_digest(asset, expected, actual_hex)
+}
+
+/// Compare hex digests. `expected` comes from the map; `actual_hex` from the download.
+pub(crate) fn verify_digest(asset: &str, expected: &str, actual_hex: &str) -> Result<(), String> {
+    let expected = expected.to_ascii_lowercase();
     let actual = actual_hex.to_ascii_lowercase();
-    if actual == *expected {
+    if actual == expected {
         Ok(())
     } else {
         Err(format!(
@@ -179,6 +204,29 @@ mod tests {
         assert!(
             verify_asset_hash(&map, "xmtp-ffi-aarch64-apple-darwin.tar.gz", EMPTY_SHA256).is_err()
         );
+    }
+
+    #[test]
+    fn cached_extract_requires_stamp_only_when_map_present() {
+        assert!(!cached_extract_is_fresh(false, None, None));
+        assert!(cached_extract_is_fresh(true, None, None));
+        assert!(cached_extract_is_fresh(true, None, Some(EMPTY_SHA256)));
+        assert!(!cached_extract_is_fresh(true, Some(EMPTY_SHA256), None));
+        assert!(!cached_extract_is_fresh(
+            true,
+            Some(EMPTY_SHA256),
+            Some(&"ab".repeat(32))
+        ));
+        assert!(cached_extract_is_fresh(
+            true,
+            Some(EMPTY_SHA256),
+            Some(EMPTY_SHA256)
+        ));
+        assert!(cached_extract_is_fresh(
+            true,
+            Some(EMPTY_SHA256),
+            Some(&format!("{}\n", EMPTY_SHA256.to_ascii_uppercase()))
+        ));
     }
 
     #[test]
