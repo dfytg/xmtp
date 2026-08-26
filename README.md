@@ -60,7 +60,7 @@ irm https://sh.qntx.org/xmtp/ps | iex
 
 ```bash
 
-# Create a profile (generates a new key, registers with XMTP)
+# Create a profile (generates a new key, encrypted local DB, registers with XMTP)
 xmtp new alice
 
 # Create a profile with a Ledger hardware wallet
@@ -83,6 +83,21 @@ xmtp clear         # delete ALL profiles
 
 # Revoke all other installations (requires wallet signature)
 xmtp revoke alice
+
+# Request history from another installation (URL from env; override with --history-url)
+xmtp sync
+xmtp sync --history-url https://message-history.dev.ephemera.network
+
+# Local device-sync archives (encrypted with db.key unless --key is given)
+xmtp archive create ./alice.xmtp
+xmtp archive import ./alice.xmtp
+xmtp archive metadata ./alice.xmtp
+xmtp archive list
+xmtp archive process
+xmtp archive send PIN
+
+# FFI tracing: RUST_LOG=debug xmtp …
+# xmtp --version includes the libxmtp version
 ```
 
 ### Linking
@@ -116,7 +131,7 @@ for c in &convs {
 
 - **xmtp** — High-level SDK. Owns all unsafe FFI calls behind safe types. `Client` is built via `ClientBuilder` with optional signer, ENS resolver, and environment selection. `Conversation` provides send/receive/sync/metadata/consent operations. Content codecs handle text, markdown, reactions, replies, attachments, and read receipts.
 - **xmtp-sys** — Auto-generated bindings from `xmtp_ffi.h`. Downloads pre-built static libraries at build time. No `libclang` required for end users.
-- **xmtp-cli** — Profile-based TUI chat client. Profiles persist configuration (environment, signer type, wallet address) in platform data directories. Signer is only required for identity-changing operations (`new`, `revoke`); TUI and `info` operate without it.
+- **xmtp-cli** — Profile-based TUI chat client. Profiles persist configuration (environment, signer type, wallet address) in platform data directories. New profiles always encrypt the local DB (`db.key` mode 0600, profile dir 0700). Unencrypted profiles are refused. Signer is only required for identity-changing operations (`new`, `revoke`); TUI and `info` operate without it.
 
 ## Feature Flags
 
@@ -231,6 +246,8 @@ Key details:
 | `aarch64-apple-darwin` | ✅ |
 | `x86_64-pc-windows-msvc` | ✅ |
 | `aarch64-pc-windows-msvc` | ✅ |
+
+Intel macOS (`x86_64-apple-darwin`) is unsupported.
 
 ## Security
 

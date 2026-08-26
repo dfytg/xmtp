@@ -21,8 +21,7 @@ pub(crate) fn create(args: &NewArgs) -> xmtp::Result<(ProfileConfig, Client)> {
         )));
     }
 
-    fs::create_dir_all(&dir).map_err(|e| xmtp::XmtpError::Io(format!("mkdir: {e}")))?;
-
+    let db_key = config::init_profile_dir(&dir)?;
     let key_path = dir.join("identity.key");
     let db_path = dir.join("messages.db3");
 
@@ -37,6 +36,7 @@ pub(crate) fn create(args: &NewArgs) -> xmtp::Result<(ProfileConfig, Client)> {
             import_hex_key(hex, &key_path)?;
         } else if let Some(ref src) = args.key {
             fs::copy(src, &key_path).map_err(|e| xmtp::XmtpError::Io(format!("copy key: {e}")))?;
+            config::chmod(&key_path, 0o600)?;
         }
         (SignerKind::File, Box::new(load_or_create_key(&key_path)?))
     };
@@ -54,7 +54,13 @@ pub(crate) fn create(args: &NewArgs) -> xmtp::Result<(ProfileConfig, Client)> {
         signer: signer_kind,
         address: address.clone(),
     };
-    let client = config::build_client(&cfg, &db_path.to_string_lossy(), Some(signer.as_ref()))?;
+    let client = config::build_client(
+        &cfg,
+        &db_path.to_string_lossy(),
+        Some(signer.as_ref()),
+        &db_key,
+        None,
+    )?;
     let inbox_id = client.inbox_id()?;
 
     // Save profile config (address is now known after signer creation).
@@ -212,31 +218,21 @@ pub(crate) fn default(name: Option<&str>, json: bool) -> xmtp::Result<()> {
     Ok(())
 }
 
-/// Decode a hex string and write as identity.key.
+/// Decode a hex string and write as identity.key (0600).
 fn import_hex_key(hex_str: &str, path: &std::path::Path) -> xmtp::Result<()> {
-    let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
-    let bytes = hex::decode(hex_str)
-        .map_err(|e| xmtp::XmtpError::InvalidArgument(format!("invalid hex: {e}")))?;
-    if bytes.len() != 32 {
-        return Err(xmtp::XmtpError::InvalidArgument(format!(
-            "key must be 32 bytes, got {}",
-            bytes.len()
-        )));
-    }
-    fs::write(path, &bytes).map_err(|e| xmtp::XmtpError::Io(format!("write key: {e}")))
+    let key = config::parse_hex32(hex_str)?;
+    config::write_secret(path, &key)
 }
 
-/// Load an existing key file or generate a new random key.
+/// Load an existing key file or generate a new random key (0600).
 fn load_or_create_key(path: &std::path::Path) -> xmtp::Result<AlloySigner> {
-    let key: [u8; 32] = if path.exists() {
-        let bytes = fs::read(path).map_err(|e| xmtp::XmtpError::Io(format!("read key: {e}")))?;
-        bytes
-            .try_into()
-            .map_err(|_| xmtp::XmtpError::InvalidArgument("key file must be 32 bytes".into()))?
+    let key = if path.exists() {
+        let key = config::read_key32(path)?;
+        config::chmod(path, 0o600)?;
+        key
     } else {
-        let mut key = [0u8; 32];
-        getrandom::fill(&mut key).map_err(|e| xmtp::XmtpError::Io(format!("rng: {e}")))?;
-        fs::write(path, key).map_err(|e| xmtp::XmtpError::Io(format!("write key: {e}")))?;
+        let key = config::random_key32()?;
+        config::write_secret(path, &key)?;
         key
     };
     AlloySigner::from_bytes(&key)
