@@ -140,13 +140,16 @@ pub unsafe extern "C" fn xmtp_device_sync_list_available_archives(
         let items: Vec<FfiAvailableArchive> = archives
             .into_iter()
             .map(|a| {
+                let pin = to_cstring(&a.pin)?;
                 let inst = a.sent_by_installation;
                 let inst_len = inst.len() as i32;
-                // Use into_boxed_slice to guarantee cap == len for safe deallocation
-                let inst_boxed = inst.into_boxed_slice();
-                let inst_ptr = Box::into_raw(inst_boxed) as *mut u8;
+                let inst_ptr = if inst.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    Box::into_raw(inst.into_boxed_slice()) as *mut u8
+                };
                 Ok(FfiAvailableArchive {
-                    pin: to_c_string(&a.pin)?,
+                    pin: pin.into_raw(),
                     backup_version: a.metadata.backup_version,
                     exported_at_ns: a.metadata.exported_at_ns,
                     sent_by_installation: inst_ptr,
@@ -193,21 +196,8 @@ pub unsafe extern "C" fn xmtp_available_archive_exported_at_ns(
 /// Free an available archive list.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xmtp_available_archive_list_free(list: *mut FfiAvailableArchiveList) {
-    if list.is_null() {
-        return;
-    }
-    let l = unsafe { Box::from_raw(list) };
-    for item in &l.items {
-        free_c_strings!(item, pin);
-        if !item.sent_by_installation.is_null() && item.sent_by_installation_len > 0 {
-            drop(unsafe {
-                Vec::from_raw_parts(
-                    item.sent_by_installation,
-                    item.sent_by_installation_len as usize,
-                    item.sent_by_installation_len as usize,
-                )
-            });
-        }
+    if !list.is_null() {
+        drop(unsafe { Box::from_raw(list) });
     }
 }
 

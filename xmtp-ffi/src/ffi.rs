@@ -295,6 +295,35 @@ pub struct FfiInboxStateList {
     pub(crate) items: Vec<FfiInboxStateItem>,
 }
 
+impl Drop for FfiInboxStateItem {
+    fn drop(&mut self) {
+        if !self.inbox_id.is_null() {
+            drop(unsafe { CString::from_raw(self.inbox_id) });
+            self.inbox_id = std::ptr::null_mut();
+        }
+        if !self.recovery_identifier.is_null() {
+            drop(unsafe { CString::from_raw(self.recovery_identifier) });
+            self.recovery_identifier = std::ptr::null_mut();
+        }
+        free_c_string_array(self.identifiers, self.identifiers_count);
+        self.identifiers = std::ptr::null_mut();
+        self.identifiers_count = 0;
+        free_c_string_array(self.installation_ids, self.installation_ids_count);
+        self.installation_ids = std::ptr::null_mut();
+        if !self.installation_client_timestamps.is_null() && self.installation_ids_count > 0 {
+            drop(unsafe {
+                Vec::from_raw_parts(
+                    self.installation_client_timestamps,
+                    self.installation_ids_count as usize,
+                    self.installation_ids_count as usize,
+                )
+            });
+            self.installation_client_timestamps = std::ptr::null_mut();
+        }
+        self.installation_ids_count = 0;
+    }
+}
+
 /// A consent record exposed to C.
 #[repr(C)]
 pub struct FfiConsentRecord {
@@ -451,6 +480,26 @@ pub struct FfiAvailableArchiveList {
     pub(crate) items: Vec<FfiAvailableArchive>,
 }
 
+impl Drop for FfiAvailableArchive {
+    fn drop(&mut self) {
+        if !self.pin.is_null() {
+            drop(unsafe { CString::from_raw(self.pin) });
+            self.pin = std::ptr::null_mut();
+        }
+        if !self.sent_by_installation.is_null() && self.sent_by_installation_len > 0 {
+            drop(unsafe {
+                Vec::from_raw_parts(
+                    self.sent_by_installation,
+                    self.sent_by_installation_len as usize,
+                    self.sent_by_installation_len as usize,
+                )
+            });
+            self.sent_by_installation = std::ptr::null_mut();
+            self.sent_by_installation_len = 0;
+        }
+    }
+}
+
 /// Opaque handle for gateway authentication credentials.
 pub struct FfiAuthHandle {
     pub(crate) inner: xmtp_api_d14n::AuthHandle,
@@ -476,6 +525,19 @@ pub struct FfiKeyPackageStatusList {
     pub(crate) items: Vec<FfiKeyPackageStatus>,
 }
 
+impl Drop for FfiKeyPackageStatus {
+    fn drop(&mut self) {
+        if !self.installation_id.is_null() {
+            drop(unsafe { CString::from_raw(self.installation_id) });
+            self.installation_id = std::ptr::null_mut();
+        }
+        if !self.validation_error.is_null() {
+            drop(unsafe { CString::from_raw(self.validation_error) });
+            self.validation_error = std::ptr::null_mut();
+        }
+    }
+}
+
 /// Inbox update count entry (inbox_id → count).
 #[repr(C)]
 pub struct FfiInboxUpdateCount {
@@ -488,12 +550,30 @@ pub struct FfiInboxUpdateCountList {
     pub(crate) items: Vec<FfiInboxUpdateCount>,
 }
 
+impl Drop for FfiInboxUpdateCount {
+    fn drop(&mut self) {
+        if !self.inbox_id.is_null() {
+            drop(unsafe { CString::from_raw(self.inbox_id) });
+            self.inbox_id = std::ptr::null_mut();
+        }
+    }
+}
+
 /// Group metadata (creator + conversation type).
 #[repr(C)]
 pub struct FfiGroupMetadata {
     /// Creator inbox ID (owned string).
     pub creator_inbox_id: *mut c_char,
     pub conversation_type: FfiConversationType,
+}
+
+impl Drop for FfiGroupMetadata {
+    fn drop(&mut self) {
+        if !self.creator_inbox_id.is_null() {
+            drop(unsafe { CString::from_raw(self.creator_inbox_id) });
+            self.creator_inbox_id = std::ptr::null_mut();
+        }
+    }
 }
 
 /// Permission policy set for a conversation.
@@ -595,6 +675,15 @@ pub struct FfiLastReadTimeEntry {
 /// A list of last-read-time entries.
 pub struct FfiLastReadTimeList {
     pub(crate) items: Vec<FfiLastReadTimeEntry>,
+}
+
+impl Drop for FfiLastReadTimeEntry {
+    fn drop(&mut self) {
+        if !self.inbox_id.is_null() {
+            drop(unsafe { CString::from_raw(self.inbox_id) });
+            self.inbox_id = std::ptr::null_mut();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1001,22 +1090,6 @@ macro_rules! free_c_strings {
     };
 }
 
-/// Generate a free function for a list type whose items only contain owned C strings.
-macro_rules! ffi_list_free {
-    ($fn_name:ident, $list_ty:ty, [$($field:ident),+ $(,)?]) => {
-        #[unsafe(no_mangle)]
-        pub unsafe extern "C" fn $fn_name(list: *mut $list_ty) {
-            if list.is_null() {
-                return;
-            }
-            let l = unsafe { Box::from_raw(list) };
-            for item in &l.items {
-                $crate::ffi::free_c_strings!(item, $($field),+);
-            }
-        }
-    };
-}
-
 /// Generate a conversation string property getter (returns `*mut c_char`).
 /// Inner method must return `Result<String, _>`.
 macro_rules! conv_string_getter {
@@ -1120,7 +1193,6 @@ pub(crate) use conv_inbox_check;
 pub(crate) use conv_string_getter;
 pub(crate) use conv_string_list_getter;
 pub(crate) use conv_string_setter;
-pub(crate) use ffi_list_free;
 pub(crate) use ffi_list_get;
 pub(crate) use ffi_list_len;
 pub(crate) use free_c_strings;

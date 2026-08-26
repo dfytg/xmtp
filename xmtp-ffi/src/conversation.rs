@@ -1369,11 +1369,12 @@ pub unsafe extern "C" fn xmtp_conversation_group_metadata(
             return Err("null output pointer".into());
         }
         let metadata = conv.inner.metadata().await?;
+        let creator_inbox_id = to_cstring(&metadata.creator_inbox_id)?;
         unsafe {
             write_out(
                 out,
                 FfiGroupMetadata {
-                    creator_inbox_id: to_c_string(&metadata.creator_inbox_id)?,
+                    creator_inbox_id: creator_inbox_id.into_raw(),
                     conversation_type: conversation_type_to_ffi(metadata.conversation_type),
                 },
             )?
@@ -1385,12 +1386,8 @@ pub unsafe extern "C" fn xmtp_conversation_group_metadata(
 /// Free a group metadata struct.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xmtp_group_metadata_free(meta: *mut FfiGroupMetadata) {
-    if meta.is_null() {
-        return;
-    }
-    let m = unsafe { Box::from_raw(meta) };
-    if !m.creator_inbox_id.is_null() {
-        drop(unsafe { CString::from_raw(m.creator_inbox_id) });
+    if !meta.is_null() {
+        drop(unsafe { Box::from_raw(meta) });
     }
 }
 
@@ -1638,8 +1635,9 @@ pub unsafe extern "C" fn xmtp_conversation_last_read_times(
         let items: Vec<FfiLastReadTimeEntry> = times
             .into_iter()
             .map(|(inbox_id, ts)| {
+                let inbox_id = to_cstring(&inbox_id)?;
                 Ok(FfiLastReadTimeEntry {
-                    inbox_id: to_c_string(&inbox_id)?,
+                    inbox_id: inbox_id.into_raw(),
                     timestamp_ns: ts,
                 })
             })
@@ -1656,11 +1654,12 @@ ffi_list_get!(
     FfiLastReadTimeEntry
 );
 
-ffi_list_free!(
-    xmtp_last_read_time_list_free,
-    FfiLastReadTimeList,
-    [inbox_id]
-);
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xmtp_last_read_time_list_free(list: *mut FfiLastReadTimeList) {
+    if !list.is_null() {
+        drop(unsafe { Box::from_raw(list) });
+    }
+}
 
 /// Free an HMAC key map (including all owned data).
 #[unsafe(no_mangle)]

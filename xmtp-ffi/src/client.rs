@@ -428,7 +428,11 @@ fn association_state_to_item(
         let ptrs: Vec<*mut c_char> = inst_cs.into_iter().map(CString::into_raw).collect();
         Box::into_raw(ptrs.into_boxed_slice()) as *mut *mut c_char
     };
-    let ts_ptr = Box::into_raw(timestamps.into_boxed_slice()) as *mut i64;
+    let ts_ptr = if timestamps.is_empty() {
+        std::ptr::null_mut()
+    } else {
+        Box::into_raw(timestamps.into_boxed_slice()) as *mut i64
+    };
     Ok(FfiInboxStateItem {
         inbox_id: inbox_cs.into_raw(),
         recovery_identifier: recovery_cs.into_raw(),
@@ -812,24 +816,8 @@ pub unsafe extern "C" fn xmtp_inbox_state_installation_ids(
 /// Free an inbox state list.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xmtp_inbox_state_list_free(list: *mut FfiInboxStateList) {
-    if list.is_null() {
-        return;
-    }
-    let l = unsafe { Box::from_raw(list) };
-    for item in &l.items {
-        free_c_strings!(item, inbox_id, recovery_identifier);
-        free_c_string_array(item.identifiers, item.identifiers_count);
-        free_c_string_array(item.installation_ids, item.installation_ids_count);
-        // Free the parallel timestamp array (heap-allocated via into_raw_parts)
-        if !item.installation_client_timestamps.is_null() && item.installation_ids_count > 0 {
-            drop(unsafe {
-                Vec::from_raw_parts(
-                    item.installation_client_timestamps,
-                    item.installation_ids_count as usize,
-                    item.installation_ids_count as usize,
-                )
-            });
-        }
+    if !list.is_null() {
+        drop(unsafe { Box::from_raw(list) });
     }
 }
 
@@ -924,8 +912,9 @@ pub unsafe extern "C" fn xmtp_client_fetch_inbox_updates_count(
         let items: Vec<FfiInboxUpdateCount> = counts
             .into_iter()
             .map(|(id, cnt)| {
+                let inbox_id = to_cstring(&id)?;
                 Ok(FfiInboxUpdateCount {
-                    inbox_id: to_c_string(&id)?,
+                    inbox_id: inbox_id.into_raw(),
                     count: cnt,
                 })
             })
@@ -963,12 +952,8 @@ ffi_list_get!(
 /// Free an inbox update count list.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xmtp_inbox_update_count_list_free(list: *mut FfiInboxUpdateCountList) {
-    if list.is_null() {
-        return;
-    }
-    let l = unsafe { Box::from_raw(list) };
-    for item in &l.items {
-        free_c_strings!(item, inbox_id);
+    if !list.is_null() {
+        drop(unsafe { Box::from_raw(list) });
     }
 }
 
@@ -1006,21 +991,26 @@ pub unsafe extern "C" fn xmtp_client_fetch_key_package_statuses(
             .map(|(id, result)| match result {
                 Ok(kp) => {
                     let lifetime = kp.life_time();
+                    let installation_id = to_cstring(&hex::encode(&id))?;
                     Ok(FfiKeyPackageStatus {
-                        installation_id: to_c_string(&hex::encode(&id))?,
+                        installation_id: installation_id.into_raw(),
                         valid: 1,
                         not_before: lifetime.as_ref().map(|l| l.not_before).unwrap_or(0),
                         not_after: lifetime.as_ref().map(|l| l.not_after).unwrap_or(0),
                         validation_error: std::ptr::null_mut(),
                     })
                 }
-                Err(e) => Ok(FfiKeyPackageStatus {
-                    installation_id: to_c_string(&hex::encode(&id))?,
-                    valid: 0,
-                    not_before: 0,
-                    not_after: 0,
-                    validation_error: to_c_string(&e.to_string())?,
-                }),
+                Err(e) => {
+                    let installation_id = to_cstring(&hex::encode(&id))?;
+                    let validation_error = to_cstring(&e.to_string())?;
+                    Ok(FfiKeyPackageStatus {
+                        installation_id: installation_id.into_raw(),
+                        valid: 0,
+                        not_before: 0,
+                        not_after: 0,
+                        validation_error: validation_error.into_raw(),
+                    })
+                }
             })
             .collect::<Result<_, Box<dyn std::error::Error>>>()?;
 
@@ -1039,12 +1029,8 @@ ffi_list_get!(
 /// Free a key package status list.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xmtp_key_package_status_list_free(list: *mut FfiKeyPackageStatusList) {
-    if list.is_null() {
-        return;
-    }
-    let l = unsafe { Box::from_raw(list) };
-    for item in &l.items {
-        free_c_strings!(item, installation_id, validation_error);
+    if !list.is_null() {
+        drop(unsafe { Box::from_raw(list) });
     }
 }
 
