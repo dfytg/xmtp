@@ -111,7 +111,7 @@ It emits an opaque forward declaration instead of a nullable function pointer.
 > - After installing via `choco`, **restart your terminal** so PATH changes take effect.
 > - **Strawberry Perl** is mandatory for building `xmtp-ffi` on Windows. The Perl bundled with Git for Windows (MSYS2) is insufficient — it lacks modules required by OpenSSL's `Configure` script.
 > - **LLVM** is only needed when running `make regenerate-bindings`. Normal `cargo build` of `xmtp-sys` uses pre-committed bindings.
-> - **sccache** is configured in `xmtp-ffi/.cargo/config.toml`. If you don't have it installed, comment out the `rustc-wrapper = "sccache"` line or install it.
+> - **sccache** is optional. Set `XMTP_SCCACHE=1` (Makefile/Justfile `ffi-build`/`ffi-check`) or `RUSTC_WRAPPER=sccache`. `xmtp-ffi/.cargo/config.toml` does not hard-require it.
 > - A quick way to refresh PATH in the current PowerShell session without restarting:
 >
 >   ```powershell
@@ -126,6 +126,7 @@ It emits an opaque forward declaration instead of a nullable function pointer.
 | `XMTP_FFI_VERSION` | Override FFI release version to download. Defaults to crate version. |
 | `XMTP_UPDATE_BINDINGS` | When set with `regenerate` feature, copies generated bindings to `src/bindings.rs`. |
 | `XMTP_GEN_HEADER` | Set to `1` to run cbindgen (requires nightly). Committed `include/xmtp_ffi.h` is used as-is otherwise. |
+| `XMTP_SCCACHE` | Set to `1` to use `sccache` as `RUSTC_WRAPPER` for `make ffi-build` / `make ffi-check`. |
 
 ### Common Commands
 

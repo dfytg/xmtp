@@ -22,7 +22,7 @@ free_opaque!(xmtp_conversation_free, FfiConversation);
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xmtp_conversation_id(conv: *const FfiConversation) -> *mut c_char {
     match unsafe { ref_from(conv) } {
-        Ok(c) => to_c_string(&hex::encode(&c.inner.group_id)),
+        Ok(c) => to_c_string_or_null(&hex::encode(&c.inner.group_id)),
         Err(_) => std::ptr::null_mut(),
     }
 }
@@ -55,7 +55,7 @@ pub unsafe extern "C" fn xmtp_conversation_dm_peer_inbox_id(
         Ok(c) => {
             let inbox_id = c.inner.context.inbox_id();
             match &c.inner.dm_id {
-                Some(dm_id) => to_c_string(&dm_id.other_inbox_id(inbox_id)),
+                Some(dm_id) => to_c_string_or_null(&dm_id.other_inbox_id(inbox_id)),
                 None => std::ptr::null_mut(),
             }
         }
@@ -94,10 +94,7 @@ pub unsafe extern "C" fn xmtp_conversation_send(
 ) -> i32 {
     catch_async(|| async {
         let c = unsafe { ref_from(conv)? };
-        if content_bytes.is_null() || content_len <= 0 {
-            return Err("null or empty content".into());
-        }
-        let bytes = unsafe { std::slice::from_raw_parts(content_bytes, content_len as usize) };
+        let bytes = checked_slice_nonempty(content_bytes, content_len)?;
 
         let send_opts = if opts.is_null() {
             xmtp_mls::groups::send_message_opts::SendMessageOpts::default()
@@ -111,7 +108,7 @@ pub unsafe extern "C" fn xmtp_conversation_send(
 
         if !out_id.is_null() {
             unsafe {
-                *out_id = to_c_string(&hex::encode(&msg_id));
+                *out_id = to_c_string(&hex::encode(&msg_id))?;
             }
         }
         Ok(())
@@ -130,10 +127,7 @@ pub unsafe extern "C" fn xmtp_conversation_send_optimistic(
 ) -> i32 {
     catch(|| {
         let c = unsafe { ref_from(conv)? };
-        if content_bytes.is_null() || content_len <= 0 {
-            return Err("null or empty content".into());
-        }
-        let bytes = unsafe { std::slice::from_raw_parts(content_bytes, content_len as usize) };
+        let bytes = checked_slice_nonempty(content_bytes, content_len)?;
 
         let send_opts = if opts.is_null() {
             xmtp_mls::groups::send_message_opts::SendMessageOpts::default()
@@ -147,7 +141,7 @@ pub unsafe extern "C" fn xmtp_conversation_send_optimistic(
 
         if !out_id.is_null() {
             unsafe {
-                *out_id = to_c_string(&hex::encode(&msg_id));
+                *out_id = to_c_string(&hex::encode(&msg_id))?;
             }
         }
         Ok(())
@@ -177,16 +171,13 @@ pub unsafe extern "C" fn xmtp_conversation_prepare_message(
 ) -> i32 {
     catch(|| {
         let c = unsafe { ref_from(conv)? };
-        if content_bytes.is_null() || content_len <= 0 {
-            return Err("null or empty content".into());
-        }
-        let bytes = unsafe { std::slice::from_raw_parts(content_bytes, content_len as usize) };
+        let bytes = checked_slice_nonempty(content_bytes, content_len)?;
         let msg_id = c
             .inner
             .prepare_message_for_later_publish(bytes, should_push != 0)?;
         if !out_id.is_null() {
             unsafe {
-                *out_id = to_c_string(&hex::encode(&msg_id));
+                *out_id = to_c_string(&hex::encode(&msg_id))?;
             }
         }
         Ok(())
@@ -249,15 +240,30 @@ pub struct FfiListMessagesOptions {
     pub exclude_disappearing: i32,
 }
 
+fn optional_content_types(
+    ptr: *const i32,
+    count: i32,
+) -> Result<Option<Vec<xmtp_db::group_message::ContentType>>, Box<dyn std::error::Error>> {
+    if ptr.is_null() || count == 0 {
+        return Ok(None);
+    }
+    let slice = checked_slice(ptr, count)?;
+    let cts: Vec<xmtp_db::group_message::ContentType> = slice
+        .iter()
+        .filter_map(|&v| i32_to_content_type(v))
+        .collect();
+    Ok(if cts.is_empty() { None } else { Some(cts) })
+}
+
 /// Parse message query options from C struct into `MsgQueryArgs`.
 fn parse_msg_query_args(
     opts: *const FfiListMessagesOptions,
-) -> xmtp_db::group_message::MsgQueryArgs {
+) -> Result<xmtp_db::group_message::MsgQueryArgs, Box<dyn std::error::Error>> {
     use xmtp_db::group_message::*;
 
     let mut args = MsgQueryArgs::default();
     if opts.is_null() {
-        return args;
+        return Ok(args);
     }
     let o = unsafe { &*opts };
 
@@ -295,45 +301,22 @@ fn parse_msg_query_args(
         1 => Some(SortBy::InsertedAt),
         _ => None, // 0 or default = SentAt (MsgQueryArgs default)
     };
-    if !o.content_types.is_null() && o.content_types_count > 0 {
-        let slice =
-            unsafe { std::slice::from_raw_parts(o.content_types, o.content_types_count as usize) };
-        let cts: Vec<ContentType> = slice
-            .iter()
-            .filter_map(|&v| i32_to_content_type(v))
-            .collect();
-        if !cts.is_empty() {
-            args.content_types = Some(cts);
-        }
-    }
-    if !o.exclude_content_types.is_null() && o.exclude_content_types_count > 0 {
-        let slice = unsafe {
-            std::slice::from_raw_parts(
-                o.exclude_content_types,
-                o.exclude_content_types_count as usize,
-            )
-        };
-        let cts: Vec<ContentType> = slice
-            .iter()
-            .filter_map(|&v| i32_to_content_type(v))
-            .collect();
-        if !cts.is_empty() {
-            args.exclude_content_types = Some(cts);
-        }
-    }
-    if !o.exclude_sender_inbox_ids.is_null() && o.exclude_sender_inbox_ids_count > 0 {
+    args.content_types = optional_content_types(o.content_types, o.content_types_count)?;
+    args.exclude_content_types =
+        optional_content_types(o.exclude_content_types, o.exclude_content_types_count)?;
+    if o.exclude_sender_inbox_ids.is_null() || o.exclude_sender_inbox_ids_count == 0 {
+        // no filter
+    } else {
         let ids = unsafe {
-            collect_strings(o.exclude_sender_inbox_ids, o.exclude_sender_inbox_ids_count)
+            collect_strings(o.exclude_sender_inbox_ids, o.exclude_sender_inbox_ids_count)?
         };
-        if let Ok(ids) = ids
-            && !ids.is_empty()
-        {
+        if !ids.is_empty() {
             args.exclude_sender_inbox_ids = Some(ids);
         }
     }
     args.exclude_disappearing = o.exclude_disappearing != 0;
 
-    args
+    Ok(args)
 }
 
 /// List messages in this conversation. Caller must free with [`xmtp_message_list_free`].
@@ -348,7 +331,7 @@ pub unsafe extern "C" fn xmtp_conversation_list_messages(
         if out.is_null() {
             return Err("null output pointer".into());
         }
-        let args = parse_msg_query_args(opts);
+        let args = parse_msg_query_args(opts)?;
         let messages = c.inner.find_messages(&args)?;
         unsafe { write_out(out, FfiMessageList { items: messages })? };
         Ok(())
@@ -363,10 +346,13 @@ pub unsafe extern "C" fn xmtp_conversation_count_messages(
     opts: *const FfiListMessagesOptions,
 ) -> i64 {
     match unsafe { ref_from(conv) } {
-        Ok(c) => {
-            let args = parse_msg_query_args(opts);
-            c.inner.count_messages(&args).unwrap_or(0)
-        }
+        Ok(c) => match parse_msg_query_args(opts) {
+            Ok(args) => c.inner.count_messages(&args).unwrap_or(0),
+            Err(e) => {
+                set_last_error(e.to_string());
+                0
+            }
+        },
         Err(_) => 0,
     }
 }
@@ -388,7 +374,7 @@ unsafe fn msg_at(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xmtp_message_id(list: *const FfiMessageList, index: i32) -> *mut c_char {
     match unsafe { msg_at(list, index) } {
-        Some(m) => to_c_string(&hex::encode(&m.id)),
+        Some(m) => to_c_string_or_null(&hex::encode(&m.id)),
         None => std::ptr::null_mut(),
     }
 }
@@ -400,7 +386,7 @@ pub unsafe extern "C" fn xmtp_message_sender_inbox_id(
     index: i32,
 ) -> *mut c_char {
     match unsafe { msg_at(list, index) } {
-        Some(m) => to_c_string(&m.sender_inbox_id),
+        Some(m) => to_c_string_or_null(&m.sender_inbox_id),
         None => std::ptr::null_mut(),
     }
 }
@@ -476,7 +462,7 @@ free_opaque!(xmtp_message_free, FfiMessage);
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xmtp_single_message_id(msg: *const FfiMessage) -> *mut c_char {
     match unsafe { ref_from(msg) } {
-        Ok(m) => to_c_string(&hex::encode(&m.inner.id)),
+        Ok(m) => to_c_string_or_null(&hex::encode(&m.inner.id)),
         Err(_) => std::ptr::null_mut(),
     }
 }
@@ -486,7 +472,7 @@ pub unsafe extern "C" fn xmtp_single_message_id(msg: *const FfiMessage) -> *mut 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xmtp_single_message_group_id(msg: *const FfiMessage) -> *mut c_char {
     match unsafe { ref_from(msg) } {
-        Ok(m) => to_c_string(&hex::encode(&m.inner.group_id)),
+        Ok(m) => to_c_string_or_null(&hex::encode(&m.inner.group_id)),
         Err(_) => std::ptr::null_mut(),
     }
 }
@@ -498,7 +484,7 @@ pub unsafe extern "C" fn xmtp_single_message_sender_inbox_id(
     msg: *const FfiMessage,
 ) -> *mut c_char {
     match unsafe { ref_from(msg) } {
-        Ok(m) => to_c_string(&m.inner.sender_inbox_id),
+        Ok(m) => to_c_string_or_null(&m.inner.sender_inbox_id),
         Err(_) => std::ptr::null_mut(),
     }
 }
@@ -561,13 +547,13 @@ pub unsafe extern "C" fn xmtp_conversation_list_members(
                     .map(|i| i.to_string())
                     .collect();
                 let mut ident_count: i32 = 0;
-                let ident_ptrs = string_vec_to_c(ident_strs, &mut ident_count);
+                let ident_ptrs = string_vec_to_c(ident_strs, &mut ident_count)?;
                 // Build installation IDs array (hex-encoded)
                 let inst_strs: Vec<String> = m.installation_ids.iter().map(hex::encode).collect();
                 let mut inst_count: i32 = 0;
-                let inst_ptrs = string_vec_to_c(inst_strs, &mut inst_count);
-                FfiGroupMember {
-                    inbox_id: to_c_string(&m.inbox_id),
+                let inst_ptrs = string_vec_to_c(inst_strs, &mut inst_count)?;
+                Ok(FfiGroupMember {
+                    inbox_id: to_c_string(&m.inbox_id)?,
                     permission_level: match m.permission_level {
                         PermissionLevel::Member => FfiPermissionLevel::Member,
                         PermissionLevel::Admin => FfiPermissionLevel::Admin,
@@ -578,9 +564,9 @@ pub unsafe extern "C" fn xmtp_conversation_list_members(
                     account_identifiers_count: ident_count,
                     installation_ids: inst_ptrs,
                     installation_ids_count: inst_count,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<_, Box<dyn std::error::Error>>>()?;
         unsafe { write_out(out, FfiGroupMemberList { items: members })? };
         Ok(())
     })
@@ -602,7 +588,7 @@ pub unsafe extern "C" fn xmtp_group_member_inbox_id(
         // Return a copy; original owned by the list
         Some(m) if !m.inbox_id.is_null() => {
             let s = unsafe { CStr::from_ptr(m.inbox_id) };
-            to_c_string(s.to_str().unwrap_or(""))
+            to_c_string_or_null(s.to_str().unwrap_or(""))
         }
         _ => std::ptr::null_mut(),
     }
@@ -1125,7 +1111,7 @@ pub unsafe extern "C" fn xmtp_conversation_paused_for_version(
         let version = c.inner.paused_for_version()?;
         unsafe {
             *out = match version {
-                Some(v) => to_c_string(&v),
+                Some(v) => to_c_string(&v)?,
                 None => std::ptr::null_mut(),
             };
         }
@@ -1168,14 +1154,14 @@ pub unsafe extern "C" fn xmtp_conversation_debug_info(
             *out = FfiConversationDebugInfo {
                 epoch: info.epoch,
                 maybe_forked: i32::from(info.maybe_forked),
-                fork_details: to_c_string(&info.fork_details),
+                fork_details: to_c_string(&info.fork_details)?,
                 is_commit_log_forked: match info.is_commit_log_forked {
                     Some(true) => 1,
                     Some(false) => 0,
                     None => -1,
                 },
-                local_commit_log: to_c_string(&info.local_commit_log),
-                remote_commit_log: to_c_string(&info.remote_commit_log),
+                local_commit_log: to_c_string(&info.local_commit_log)?,
+                remote_commit_log: to_c_string(&info.remote_commit_log)?,
                 cursors: cursors_ptr,
                 cursors_count,
             };
@@ -1228,14 +1214,14 @@ pub unsafe extern "C" fn xmtp_conversation_hmac_keys(
         if let Ok(dups) = c.inner.find_duplicate_dms() {
             for dup in dups {
                 if let Ok(keys) = dup.hmac_keys(-1..=1) {
-                    entries.push(hmac_keys_to_entry(&dup.group_id, keys));
+                    entries.push(hmac_keys_to_entry(&dup.group_id, keys)?);
                 }
             }
         }
 
         // Include this conversation
         let keys = c.inner.hmac_keys(-1..=1)?;
-        entries.push(hmac_keys_to_entry(&c.inner.group_id, keys));
+        entries.push(hmac_keys_to_entry(&c.inner.group_id, keys)?);
 
         unsafe { write_out(out, FfiHmacKeyMap { entries })? };
         Ok(())
@@ -1246,7 +1232,7 @@ pub unsafe extern "C" fn xmtp_conversation_hmac_keys(
 pub(crate) fn hmac_keys_to_entry(
     group_id: &[u8],
     keys: Vec<xmtp_db::user_preferences::HmacKey>,
-) -> FfiHmacKeyEntry {
+) -> Result<FfiHmacKeyEntry, Box<dyn std::error::Error>> {
     let c_keys: Vec<FfiHmacKey> = keys
         .into_iter()
         .map(|k| {
@@ -1265,11 +1251,11 @@ pub(crate) fn hmac_keys_to_entry(
     let keys_count = c_keys.len() as i32;
     let keys_boxed = c_keys.into_boxed_slice();
     let keys_ptr = Box::into_raw(keys_boxed) as *mut FfiHmacKey;
-    FfiHmacKeyEntry {
-        group_id: to_c_string(&hex::encode(group_id)),
+    Ok(FfiHmacKeyEntry {
+        group_id: to_c_string(&hex::encode(group_id))?,
         keys: keys_ptr,
         keys_count,
-    }
+    })
 }
 
 /// Get the number of entries in an HMAC key map.
@@ -1345,9 +1331,7 @@ pub unsafe extern "C" fn xmtp_conversation_process_streamed_group_message(
         if out.is_null() {
             return Err("null output pointer".into());
         }
-        let bytes =
-            unsafe { std::slice::from_raw_parts(envelope_bytes, envelope_bytes_len as usize) }
-                .to_vec();
+        let bytes = checked_slice_nonempty(envelope_bytes, envelope_bytes_len)?.to_vec();
         let messages = conv.inner.process_streamed_group_message(bytes).await?;
         unsafe { write_out(out, FfiMessageList { items: messages })? };
         Ok(())
@@ -1375,7 +1359,7 @@ pub unsafe extern "C" fn xmtp_conversation_group_metadata(
             write_out(
                 out,
                 FfiGroupMetadata {
-                    creator_inbox_id: to_c_string(&metadata.creator_inbox_id),
+                    creator_inbox_id: to_c_string(&metadata.creator_inbox_id)?,
                     conversation_type: conversation_type_to_ffi(metadata.conversation_type),
                 },
             )?
@@ -1519,7 +1503,7 @@ free_opaque!(xmtp_group_permissions_free, FfiGroupPermissions);
 pub(crate) fn decoded_to_enriched(
     msg: &xmtp_mls::messages::decoded_message::DecodedMessage,
     raw_content: &[u8],
-) -> FfiEnrichedMessage {
+) -> Result<FfiEnrichedMessage, Box<dyn std::error::Error>> {
     let ct = &msg.metadata.content_type;
     let ct_str = format!(
         "{}/{}:{}.{}",
@@ -1532,11 +1516,11 @@ pub(crate) fn decoded_to_enriched(
         let len = b.len() as i32;
         (Box::into_raw(b) as *mut u8, len)
     };
-    FfiEnrichedMessage {
-        id: to_c_string(&hex::encode(&msg.metadata.id)),
-        group_id: to_c_string(&hex::encode(&msg.metadata.group_id)),
-        sender_inbox_id: to_c_string(&msg.metadata.sender_inbox_id),
-        sender_installation_id: to_c_string(&hex::encode(&msg.metadata.sender_installation_id)),
+    Ok(FfiEnrichedMessage {
+        id: to_c_string(&hex::encode(&msg.metadata.id))?,
+        group_id: to_c_string(&hex::encode(&msg.metadata.group_id))?,
+        sender_inbox_id: to_c_string(&msg.metadata.sender_inbox_id)?,
+        sender_installation_id: to_c_string(&hex::encode(&msg.metadata.sender_installation_id))?,
         sent_at_ns: msg.metadata.sent_at_ns,
         inserted_at_ns: msg.metadata.inserted_at_ns,
         kind: match msg.metadata.kind {
@@ -1550,9 +1534,9 @@ pub(crate) fn decoded_to_enriched(
             xmtp_db::group_message::DeliveryStatus::Published => FfiDeliveryStatus::Published,
             xmtp_db::group_message::DeliveryStatus::Failed => FfiDeliveryStatus::Failed,
         },
-        content_type: to_c_string(&ct_str),
+        content_type: to_c_string(&ct_str)?,
         fallback_text: match &msg.fallback_text {
-            Some(t) => to_c_string(t),
+            Some(t) => to_c_string(t)?,
             None => std::ptr::null_mut(),
         },
         expires_at_ns: msg.metadata.expires_at_ns.unwrap_or(0),
@@ -1560,7 +1544,7 @@ pub(crate) fn decoded_to_enriched(
         num_replies: msg.num_replies as i32,
         content_bytes,
         content_bytes_len,
-    }
+    })
 }
 
 /// List enriched (decoded) messages for a conversation.
@@ -1577,7 +1561,7 @@ pub unsafe extern "C" fn xmtp_conversation_list_enriched_messages(
         if out.is_null() {
             return Err("null output pointer".into());
         }
-        let args = parse_msg_query_args(opts);
+        let args = parse_msg_query_args(opts)?;
         let raw = conv.inner.find_messages(&args)?;
         let enriched = conv.inner.find_messages_v2(&args)?;
         // Match by message ID rather than index to prevent data misalignment
@@ -1595,7 +1579,7 @@ pub unsafe extern "C" fn xmtp_conversation_list_enriched_messages(
                     .unwrap_or(&[]);
                 decoded_to_enriched(e, bytes)
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
         unsafe { write_out(out, FfiEnrichedMessageList { items })? };
         Ok(())
     })
@@ -1652,11 +1636,13 @@ pub unsafe extern "C" fn xmtp_conversation_last_read_times(
         let times = conv.inner.get_last_read_times()?;
         let items: Vec<FfiLastReadTimeEntry> = times
             .into_iter()
-            .map(|(inbox_id, ts)| FfiLastReadTimeEntry {
-                inbox_id: to_c_string(&inbox_id),
-                timestamp_ns: ts,
+            .map(|(inbox_id, ts)| {
+                Ok(FfiLastReadTimeEntry {
+                    inbox_id: to_c_string(&inbox_id)?,
+                    timestamp_ns: ts,
+                })
             })
-            .collect();
+            .collect::<Result<_, Box<dyn std::error::Error>>>()?;
         unsafe { write_out(out, FfiLastReadTimeList { items })? };
         Ok(())
     })

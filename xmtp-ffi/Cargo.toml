@@ -12,7 +12,7 @@ description = "C FFI wrapper around libxmtp for xmtp-sys"
 [workspace]
 
 [lib]
-crate-type = ["staticlib", "cdylib"]
+crate-type = ["staticlib", "cdylib", "rlib"]
 
 [dependencies]
 # libxmtp core crates (pinned to upstream release tag)

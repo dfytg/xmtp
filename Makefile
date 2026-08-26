@@ -62,6 +62,11 @@ doc:
 header:
 	XMTP_GEN_HEADER=1 cargo +$(NIGHTLY) build --manifest-path xmtp-ffi/Cargo.toml
 
+# Optional sccache for xmtp-ffi. CI that already sets RUSTC_WRAPPER is unchanged.
+ifeq ($(XMTP_SCCACHE),1)
+export RUSTC_WRAPPER := sccache
+endif
+
 # Build the FFI static library with the crate pin (1.97.1); cbindgen skipped
 ffi-build:
 	cargo build --release --manifest-path xmtp-ffi/Cargo.toml

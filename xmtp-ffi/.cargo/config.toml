@@ -1,6 +1,6 @@
 # xmtp-ffi specific configuration.
-# sccache caches C/C++ build scripts (openssl-sys, etc.) and Rust crates,
-# drastically speeding up incremental rebuilds.
-
-[build]
-rustc-wrapper = "sccache"
+#
+# sccache is optional. Do not set `build.rustc-wrapper` here: a missing
+# sccache binary fails cargo on machines without it.
+# Enable with `XMTP_SCCACHE=1` (Makefile/Justfile `ffi-build`/`ffi-check`)
+# or `RUSTC_WRAPPER=sccache`. CI that already sets `RUSTC_WRAPPER` is unchanged.

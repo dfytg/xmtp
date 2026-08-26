@@ -3,6 +3,7 @@
 use std::cell::RefCell;
 use std::ffi::{CStr, CString, c_char};
 use std::sync::OnceLock;
+
 use tokio::runtime::Runtime;
 
 // ---------------------------------------------------------------------------
@@ -41,9 +42,19 @@ pub struct FfiSignatureRequest {
         std::sync::Arc<Box<dyn xmtp_id::scw_verifier::SmartContractSignatureVerifier>>,
 }
 
+/// Joinable stream task. `xmtp_stream_free` does not wait on this.
+pub(crate) type FfiJoinHandle = Box<
+    dyn xmtp_common::StreamHandle<
+            StreamOutput = std::result::Result<(), xmtp_mls::subscriptions::SubscribeError>,
+        > + Send,
+>;
+
 /// Opaque stream handle.
 pub struct FfiStreamHandle {
     pub(crate) abort: std::sync::Arc<Box<dyn xmtp_common::AbortHandle>>,
+    /// Joinable task; `xmtp_stream_free` drops it without waiting.
+    #[allow(dead_code, reason = "stored for join; free does not wait")]
+    pub(crate) join: std::sync::Mutex<Option<FfiJoinHandle>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -650,11 +661,65 @@ pub(crate) unsafe fn c_str_to_option(
     Ok(Some(unsafe { CStr::from_ptr(s) }.to_str()?.to_owned()))
 }
 
+/// Untrusted C buffer. Null or negative → Err. `len == 0` → Ok(&[]).
+/// Never `as usize` on a negative i32.
+pub(crate) fn checked_slice<'a, T>(
+    ptr: *const T,
+    len: i32,
+) -> Result<&'a [T], Box<dyn std::error::Error>> {
+    if ptr.is_null() {
+        return Err("null pointer".into());
+    }
+    if len < 0 {
+        return Err("negative length".into());
+    }
+    if len == 0 {
+        return Ok(&[]);
+    }
+    // SAFETY: null/negative rejected; caller must pass `len` valid `T`s.
+    Ok(unsafe { std::slice::from_raw_parts(ptr, len as usize) })
+}
+
+/// Required payload. Null, negative, or 0 → Err.
+pub(crate) fn checked_slice_nonempty<'a, T>(
+    ptr: *const T,
+    len: i32,
+) -> Result<&'a [T], Box<dyn std::error::Error>> {
+    let slice = checked_slice(ptr, len)?;
+    if slice.is_empty() {
+        return Err("empty buffer".into());
+    }
+    Ok(slice)
+}
+
+/// 32-byte DB/archive key. Null or `len != 32` → Err.
+pub(crate) fn checked_key32<'a>(
+    ptr: *const u8,
+    len: i32,
+) -> Result<&'a [u8; 32], Box<dyn std::error::Error>> {
+    if ptr.is_null() || len != 32 {
+        return Err("key must be 32 bytes".into());
+    }
+    let slice = checked_slice(ptr, 32)?;
+    slice.try_into().map_err(|_| "key must be 32 bytes".into())
+}
+
 /// Allocate a new C string from a Rust `&str`. Caller must free with [`xmtp_free_string`].
-pub(crate) fn to_c_string(s: &str) -> *mut c_char {
+pub(crate) fn to_c_string(s: &str) -> Result<*mut c_char, Box<dyn std::error::Error>> {
     CString::new(s)
         .map(CString::into_raw)
-        .unwrap_or(std::ptr::null_mut())
+        .map_err(|_| "string contains interior NUL".into())
+}
+
+/// Pointer-returning FFI: record last error on interior NUL instead of swallowing it.
+pub(crate) fn to_c_string_or_null(s: &str) -> *mut c_char {
+    match to_c_string(s) {
+        Ok(p) => p,
+        Err(e) => {
+            set_last_error(e.to_string());
+            std::ptr::null_mut()
+        }
+    }
 }
 
 /// Free a string previously returned by this library.
@@ -727,11 +792,11 @@ pub(crate) unsafe fn collect_identifiers(
     kinds: *const i32,
     count: i32,
 ) -> Result<Vec<xmtp_id::associations::Identifier>, Box<dyn std::error::Error>> {
-    if ptrs.is_null() || kinds.is_null() || count <= 0 {
-        return Err("null pointer or invalid count".into());
-    }
-    (0..count as usize)
-        .map(|i| unsafe { parse_identifier(*ptrs.add(i), *kinds.add(i)) })
+    let ptrs = checked_slice_nonempty(ptrs, count)?;
+    let kinds = checked_slice_nonempty(kinds, count)?;
+    ptrs.iter()
+        .zip(kinds.iter())
+        .map(|(&p, &kind)| unsafe { parse_identifier(p, kind) })
         .collect()
 }
 
@@ -740,26 +805,33 @@ pub(crate) unsafe fn collect_strings(
     ptrs: *const *const c_char,
     count: i32,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    if ptrs.is_null() || count <= 0 {
-        return Err("null pointer or invalid count".into());
-    }
-    (0..count as usize)
-        .map(|i| unsafe { c_str_to_string(*ptrs.add(i)) })
+    let ptrs = checked_slice_nonempty(ptrs, count)?;
+    ptrs.iter()
+        .map(|&p| unsafe { c_str_to_string(p) })
         .collect()
 }
 
 /// Convert a `Vec<String>` into a heap-allocated C string array.
 /// Caller must free each string and the array itself.
-pub(crate) fn string_vec_to_c(v: Vec<String>, out_count: *mut i32) -> *mut *mut c_char {
+pub(crate) fn string_vec_to_c(
+    v: Vec<String>,
+    out_count: *mut i32,
+) -> Result<*mut *mut c_char, Box<dyn std::error::Error>> {
+    if out_count.is_null() {
+        return Err("null output pointer".into());
+    }
     let count = v.len();
-    let ptrs: Vec<*mut c_char> = v.into_iter().map(|s| to_c_string(&s)).collect();
+    let ptrs: Vec<*mut c_char> = v
+        .into_iter()
+        .map(|s| to_c_string(&s))
+        .collect::<Result<_, _>>()?;
     // Use into_boxed_slice to guarantee cap == len, avoiding UB in from_raw_parts
     let boxed = ptrs.into_boxed_slice();
     let ptr = Box::into_raw(boxed) as *mut *mut c_char;
     unsafe {
         *out_count = count as i32;
     }
-    ptr
+    Ok(ptr)
 }
 
 // ---------------------------------------------------------------------------
@@ -868,7 +940,7 @@ macro_rules! conv_string_getter {
         ) -> *mut std::ffi::c_char {
             match unsafe { $crate::ffi::ref_from(conv) } {
                 Ok(c) => match c.inner.$method() {
-                    Ok(s) => $crate::ffi::to_c_string(&s),
+                    Ok(s) => $crate::ffi::to_c_string_or_null(&s),
                     Err(_) => std::ptr::null_mut(),
                 },
                 Err(_) => std::ptr::null_mut(),
@@ -910,7 +982,14 @@ macro_rules! conv_string_list_getter {
             }
             match unsafe { $crate::ffi::ref_from(conv) } {
                 Ok(c) => match c.inner.$method() {
-                    Ok(list) => $crate::ffi::string_vec_to_c(list, out_count),
+                    Ok(list) => match $crate::ffi::string_vec_to_c(list, out_count) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            $crate::ffi::set_last_error(e.to_string());
+                            unsafe { *out_count = 0 };
+                            std::ptr::null_mut()
+                        }
+                    },
                     Err(_) => {
                         unsafe { *out_count = 0 };
                         std::ptr::null_mut()
@@ -1011,7 +1090,7 @@ pub(crate) fn consent_record_to_c(
     FfiConsentRecord {
         entity_type: consent_type_to_ffi(r.entity_type),
         state: consent_state_to_ffi(r.state),
-        entity: to_c_string(&r.entity),
+        entity: to_c_string_or_null(&r.entity),
     }
 }
 
@@ -1042,19 +1121,17 @@ pub(crate) fn i32_to_content_type(v: i32) -> Option<xmtp_db::group_message::Cont
 
 /// Parse a consent state filter from a raw int array. Shared by conversations and streams.
 ///
-/// # Safety
-///
-/// `states` must point to a valid array of at least `count` `i32` values.
+/// `null` or `count == 0` → `Ok(None)` (no filter). Negative `count` → `Err`.
 pub(crate) fn parse_consent_states(
     states: *const i32,
     count: i32,
-) -> Option<Vec<xmtp_db::consent_record::ConsentState>> {
-    if states.is_null() || count <= 0 {
-        return None;
+) -> Result<Option<Vec<xmtp_db::consent_record::ConsentState>>, Box<dyn std::error::Error>> {
+    if states.is_null() || count == 0 {
+        return Ok(None);
     }
-    let mut result = Vec::with_capacity(count as usize);
-    for i in 0..count as usize {
-        let s = unsafe { *states.add(i) };
+    let slice = checked_slice(states, count)?;
+    let mut result = Vec::with_capacity(slice.len());
+    for &s in slice {
         result.push(match s {
             0 => xmtp_db::consent_record::ConsentState::Unknown,
             1 => xmtp_db::consent_record::ConsentState::Allowed,
@@ -1063,9 +1140,9 @@ pub(crate) fn parse_consent_states(
         });
     }
     if result.is_empty() {
-        None
+        Ok(None)
     } else {
-        Some(result)
+        Ok(Some(result))
     }
 }
 
@@ -1109,4 +1186,72 @@ pub unsafe extern "C" fn xmtp_init_logger(level: *const c_char) -> i32 {
         });
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checked_slice_len_zero_ok_empty() {
+        let p = std::ptr::NonNull::<u8>::dangling().as_ptr();
+        let s = checked_slice::<u8>(p, 0).unwrap();
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn checked_slice_null_or_negative_err() {
+        assert!(checked_slice::<u8>(std::ptr::null(), 0).is_err());
+        assert!(checked_slice::<u8>(std::ptr::null(), 4).is_err());
+        let buf = [1u8, 2];
+        assert!(checked_slice(buf.as_ptr(), -1).is_err());
+        assert_eq!(checked_slice(buf.as_ptr(), 2).unwrap(), &buf);
+    }
+
+    #[test]
+    fn checked_slice_nonempty_rejects_zero() {
+        let p = std::ptr::NonNull::<u8>::dangling().as_ptr();
+        assert!(checked_slice_nonempty::<u8>(p, 0).is_err());
+        let buf = [1u8];
+        assert_eq!(checked_slice_nonempty(buf.as_ptr(), 1).unwrap(), &[1]);
+    }
+
+    #[test]
+    fn checked_key32_len_not_32_err() {
+        let short = [0u8; 16];
+        assert!(checked_key32(short.as_ptr(), 16).is_err());
+        assert!(checked_key32(std::ptr::null(), 32).is_err());
+        assert!(checked_key32(short.as_ptr(), -1).is_err());
+        let key = [7u8; 32];
+        assert_eq!(checked_key32(key.as_ptr(), 32).unwrap(), &key);
+    }
+
+    #[test]
+    fn parse_consent_states_empty_is_none_not_err() {
+        assert!(parse_consent_states(std::ptr::null(), 0).unwrap().is_none());
+        let empty: [i32; 0] = [];
+        assert!(parse_consent_states(empty.as_ptr(), 0).unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_consent_states_negative_is_err() {
+        let s = [1i32];
+        assert!(parse_consent_states(s.as_ptr(), -1).is_err());
+    }
+
+    #[test]
+    fn parse_consent_states_values() {
+        let s = [1i32, 2, 99];
+        let got = parse_consent_states(s.as_ptr(), 3).unwrap().unwrap();
+        assert_eq!(got.len(), 2);
+    }
+
+    #[test]
+    fn to_c_string_rejects_interior_nul() {
+        let p = to_c_string("ok").unwrap();
+        unsafe { xmtp_free_string(p) };
+        assert!(to_c_string("bad\0nul").is_err());
+        assert!(to_c_string_or_null("bad\0nul").is_null());
+        assert!(xmtp_last_error_length() > 0);
+    }
 }

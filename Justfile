@@ -60,11 +60,16 @@ header:
     XMTP_GEN_HEADER=1 cargo +{{nightly}} build --manifest-path xmtp-ffi/Cargo.toml
 
 # Build the FFI static library with the crate pin (1.97.1); cbindgen skipped
+# Optional: XMTP_SCCACHE=1 just ffi-build
 ffi-build:
+    #!/usr/bin/env sh
+    if [ "${XMTP_SCCACHE:-}" = "1" ]; then export RUSTC_WRAPPER=sccache; fi
     cargo build --release --manifest-path xmtp-ffi/Cargo.toml
 
 # Check the FFI crate with the crate pin (1.97.1); cbindgen skipped
 ffi-check:
+    #!/usr/bin/env sh
+    if [ "${XMTP_SCCACHE:-}" = "1" ]; then export RUSTC_WRAPPER=sccache; fi
     cargo check --manifest-path xmtp-ffi/Cargo.toml
 
 # Regenerate xmtp-sys/src/bindings.rs from the committed C header

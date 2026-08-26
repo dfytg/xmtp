@@ -72,12 +72,7 @@ fn invoke_on_close_ok(on_close: OnCloseCb, ctx: usize, guard: &OnCloseGuard) {
 
 /// Invoke the on_close callback with an error message.
 /// No-op if already called.
-fn invoke_on_close_err(
-    on_close: OnCloseCb,
-    ctx: usize,
-    err: &str,
-    guard: &OnCloseGuard,
-) {
+fn invoke_on_close_err(on_close: OnCloseCb, ctx: usize, err: &str, guard: &OnCloseGuard) {
     if guard.swap(true, Ordering::AcqRel) {
         return; // already fired
     }
@@ -87,11 +82,16 @@ fn invoke_on_close_err(
     }
 }
 
-/// Finalize a stream handle: wait_for_ready, extract abort handle, write to output.
-fn finalize_stream(
-    handle: &mut impl StreamHandle,
+/// Finalize a stream handle: wait_for_ready, keep the joinable task, write to output.
+fn finalize_stream<H>(
+    mut handle: H,
     out: *mut *mut FfiStreamHandle,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    H: StreamHandle<StreamOutput = Result<(), xmtp_mls::subscriptions::SubscribeError>>
+        + Send
+        + 'static,
+{
     runtime().block_on(handle.wait_for_ready());
     let abort = handle.abort_handle();
     unsafe {
@@ -99,6 +99,7 @@ fn finalize_stream(
             out,
             FfiStreamHandle {
                 abort: Arc::new(abort),
+                join: std::sync::Mutex::new(Some(Box::new(handle))),
             },
         )
     }
@@ -132,7 +133,7 @@ pub unsafe extern "C" fn xmtp_stream_conversations(
         let g1 = guard.clone();
         let g2 = guard;
 
-        let mut handle = MlsClient::stream_conversations_with_callback(
+        let handle = MlsClient::stream_conversations_with_callback(
             c.inner.clone(),
             conv_type,
             move |result| match result {
@@ -145,7 +146,7 @@ pub unsafe extern "C" fn xmtp_stream_conversations(
             move || invoke_on_close_ok(on_close, ctx, &g2),
             false,
         );
-        finalize_stream(&mut handle, out)
+        finalize_stream(handle, out)
     })
 }
 
@@ -173,13 +174,13 @@ pub unsafe extern "C" fn xmtp_stream_all_messages(
             return Err("null output pointer".into());
         }
         let conv_type = parse_conv_type(conversation_type);
-        let consents = parse_consent_states(consent_states, consent_states_count);
+        let consents = parse_consent_states(consent_states, consent_states_count)?;
         let ctx = context as usize;
         let guard = new_on_close_guard();
         let g1 = guard.clone();
         let g2 = guard;
 
-        let mut handle = MlsClient::stream_all_messages_with_callback(
+        let handle = MlsClient::stream_all_messages_with_callback(
             c.inner.context.clone(),
             conv_type,
             consents,
@@ -192,7 +193,7 @@ pub unsafe extern "C" fn xmtp_stream_all_messages(
             },
             move || invoke_on_close_ok(on_close, ctx, &g2),
         );
-        finalize_stream(&mut handle, out)
+        finalize_stream(handle, out)
     })
 }
 
@@ -220,7 +221,7 @@ pub unsafe extern "C" fn xmtp_conversation_stream_messages(
         let g1 = guard.clone();
         let g2 = guard;
 
-        let mut handle = MlsGroup::stream_with_callback(
+        let handle = MlsGroup::stream_with_callback(
             c.inner.context.clone(),
             c.inner.group_id.clone(),
             move |result| match result {
@@ -232,7 +233,7 @@ pub unsafe extern "C" fn xmtp_conversation_stream_messages(
             },
             move || invoke_on_close_ok(on_close, ctx, &g2),
         );
-        finalize_stream(&mut handle, out)
+        finalize_stream(handle, out)
     })
 }
 
@@ -262,7 +263,7 @@ pub unsafe extern "C" fn xmtp_stream_consent(
         let g1 = guard.clone();
         let g2 = guard;
 
-        let mut handle = MlsClient::stream_consent_with_callback(
+        let handle = MlsClient::stream_consent_with_callback(
             c.inner.clone(),
             move |result| match result {
                 Ok(records) => {
@@ -286,7 +287,7 @@ pub unsafe extern "C" fn xmtp_stream_consent(
             },
             move || invoke_on_close_ok(on_close, ctx, &g2),
         );
-        finalize_stream(&mut handle, out)
+        finalize_stream(handle, out)
     })
 }
 
@@ -316,7 +317,7 @@ pub unsafe extern "C" fn xmtp_stream_preferences(
         let g1 = guard.clone();
         let g2 = guard;
 
-        let mut handle = MlsClient::stream_preferences_with_callback(
+        let handle = MlsClient::stream_preferences_with_callback(
             c.inner.clone(),
             move |result| match result {
                 Ok(updates) => {
@@ -373,7 +374,7 @@ pub unsafe extern "C" fn xmtp_stream_preferences(
             },
             move || invoke_on_close_ok(on_close, ctx, &g2),
         );
-        finalize_stream(&mut handle, out)
+        finalize_stream(handle, out)
     })
 }
 
@@ -434,7 +435,15 @@ pub unsafe extern "C" fn xmtp_stream_message_deletions(
             }
         });
 
-        unsafe { write_out(out, FfiStreamHandle { abort: abort_arc }) }
+        unsafe {
+            write_out(
+                out,
+                FfiStreamHandle {
+                    abort: abort_arc,
+                    join: std::sync::Mutex::new(Some(Box::new(handle))),
+                },
+            )
+        }
     })
 }
 
@@ -462,6 +471,7 @@ pub unsafe extern "C" fn xmtp_stream_is_closed(handle: *const FfiStreamHandle) -
 
 /// Free a stream handle. Must be called after `xmtp_stream_end`.
 /// Calling this on an active (non-ended) stream will also end it.
+/// Does not wait for the worker (`JoinHandle` drop detaches).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xmtp_stream_free(handle: *mut FfiStreamHandle) {
     if !handle.is_null() {

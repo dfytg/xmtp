@@ -460,10 +460,15 @@ impl ClientBuilder {
     }
 
     /// Set a 32-byte encryption key for the local database.
-    #[must_use]
-    pub fn encryption_key(mut self, k: Vec<u8>) -> Self {
+    pub fn encryption_key(mut self, k: impl Into<Vec<u8>>) -> Result<Self> {
+        let k = k.into();
+        if k.len() != 32 {
+            return Err(error::XmtpError::InvalidArgument(
+                "encryption key must be 32 bytes".into(),
+            ));
+        }
         self.encryption_key = Some(k);
-        self
+        Ok(self)
     }
 
     /// Override the API URL (instead of deriving from `env`).
@@ -557,6 +562,14 @@ impl ClientBuilder {
         let inbox_id = generate_inbox_id(address, kind, nonce)?;
         let c_inbox = to_c_string(&inbox_id)?;
         let c_app = self.app_version.as_deref().map(to_c_string).transpose()?;
+
+        if let Some(ref key) = self.encryption_key
+            && key.len() != 32
+        {
+            return Err(error::XmtpError::InvalidArgument(
+                "encryption key must be 32 bytes".into(),
+            ));
+        }
 
         let opts = xmtp_sys::XmtpFfiClientOptions {
             host: c_host.as_ptr(),
@@ -802,4 +815,38 @@ fn read_inbox_state_list(ptr: *mut xmtp_sys::XmtpFfiInboxStateList) -> Result<Ve
         });
     }
     Ok(states)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encryption_key_rejects_non_32_byte() {
+        assert!(
+            ClientBuilder::default()
+                .encryption_key(vec![0u8; 16])
+                .is_err()
+        );
+        assert!(
+            ClientBuilder::default()
+                .encryption_key(vec![0u8; 0])
+                .is_err()
+        );
+        assert!(
+            ClientBuilder::default()
+                .encryption_key(vec![0u8; 64])
+                .is_err()
+        );
+        assert!(matches!(
+            ClientBuilder::default().encryption_key(vec![0u8; 16]),
+            Err(error::XmtpError::InvalidArgument(_))
+        ));
+        assert!(
+            ClientBuilder::default()
+                .encryption_key(vec![0u8; 32])
+                .is_ok()
+        );
+        assert!(ClientBuilder::default().encryption_key([0u8; 32]).is_ok());
+    }
 }

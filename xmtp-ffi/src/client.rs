@@ -106,15 +106,10 @@ pub unsafe extern "C" fn xmtp_client_create(
         };
 
         // Parse optional encryption key
-        let enc_key: Option<xmtp_db::EncryptionKey> = if !opts.encryption_key.is_null() {
-            let slice = unsafe { std::slice::from_raw_parts(opts.encryption_key, 32) };
-            Some(
-                slice
-                    .try_into()
-                    .map_err(|_| "encryption key must be 32 bytes")?,
-            )
-        } else {
+        let enc_key: Option<xmtp_db::EncryptionKey> = if opts.encryption_key.is_null() {
             None
+        } else {
+            Some((*checked_key32(opts.encryption_key, 32)?).into())
         };
 
         // Build NativeDb — pool size and encryption methods use typestate,
@@ -196,7 +191,7 @@ free_opaque!(xmtp_client_free, FfiClient);
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xmtp_client_inbox_id(client: *const FfiClient) -> *mut c_char {
     match unsafe { ref_from(client) } {
-        Ok(c) => to_c_string(c.inner.inbox_id()),
+        Ok(c) => to_c_string_or_null(c.inner.inbox_id()),
         Err(_) => std::ptr::null_mut(),
     }
 }
@@ -205,7 +200,7 @@ pub unsafe extern "C" fn xmtp_client_inbox_id(client: *const FfiClient) -> *mut 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xmtp_client_installation_id(client: *const FfiClient) -> *mut c_char {
     match unsafe { ref_from(client) } {
-        Ok(c) => to_c_string(&hex::encode(c.inner.installation_public_key())),
+        Ok(c) => to_c_string_or_null(&hex::encode(c.inner.installation_public_key())),
         Err(_) => std::ptr::null_mut(),
     }
 }
@@ -314,16 +309,16 @@ pub unsafe extern "C" fn xmtp_client_set_consent_states(
 ) -> i32 {
     catch_async(|| async {
         let c = unsafe { ref_from(client)? };
-        if entity_types.is_null() || states.is_null() || entities.is_null() || count <= 0 {
-            return Err("null pointer or invalid count".into());
-        }
+        let entity_types = checked_slice_nonempty(entity_types, count)?;
+        let states = checked_slice_nonempty(states, count)?;
+        let entities = checked_slice_nonempty(entities, count)?;
 
         let now_ns = xmtp_common::time::now_ns();
-        let mut records = Vec::with_capacity(count as usize);
-        for i in 0..count as usize {
-            let entity = unsafe { c_str_to_string(*entities.add(i))? };
-            let entity_type = i32_to_consent_type(unsafe { *entity_types.add(i) })?;
-            let state = i32_to_consent_state(unsafe { *states.add(i) })?;
+        let mut records = Vec::with_capacity(entities.len());
+        for i in 0..entities.len() {
+            let entity = unsafe { c_str_to_string(entities[i])? };
+            let entity_type = i32_to_consent_type(entity_types[i])?;
+            let state = i32_to_consent_state(states[i])?;
             records.push(xmtp_db::consent_record::StoredConsentRecord {
                 entity_type,
                 state,
@@ -377,14 +372,16 @@ pub unsafe extern "C" fn xmtp_client_inbox_state(
             return Err("null output pointer".into());
         }
         let state = c.inner.inbox_state(refresh != 0).await?;
-        let item = association_state_to_item(&state);
+        let item = association_state_to_item(&state)?;
         unsafe { write_out(out, FfiInboxStateList { items: vec![item] })? };
         Ok(())
     })
 }
 
 /// Convert an AssociationState to an FfiInboxStateItem.
-fn association_state_to_item(s: &xmtp_id::associations::AssociationState) -> FfiInboxStateItem {
+fn association_state_to_item(
+    s: &xmtp_id::associations::AssociationState,
+) -> Result<FfiInboxStateItem, Box<dyn std::error::Error>> {
     use xmtp_id::associations::MemberIdentifier;
     let inbox_id = s.inbox_id().to_string();
     let recovery = s.recovery_identifier().to_string();
@@ -408,21 +405,21 @@ fn association_state_to_item(s: &xmtp_id::associations::AssociationState) -> Ffi
         .collect();
 
     let mut ident_count: i32 = 0;
-    let ident_ptrs = string_vec_to_c(identifiers, &mut ident_count);
+    let ident_ptrs = string_vec_to_c(identifiers, &mut ident_count)?;
     let mut inst_count: i32 = 0;
-    let inst_ptrs = string_vec_to_c(installations, &mut inst_count);
+    let inst_ptrs = string_vec_to_c(installations, &mut inst_count)?;
     // Use into_boxed_slice to guarantee cap == len for safe deallocation
     let ts_boxed = timestamps.into_boxed_slice();
     let ts_ptr = Box::into_raw(ts_boxed) as *mut i64;
-    FfiInboxStateItem {
-        inbox_id: to_c_string(&inbox_id),
-        recovery_identifier: to_c_string(&recovery),
+    Ok(FfiInboxStateItem {
+        inbox_id: to_c_string(&inbox_id)?,
+        recovery_identifier: to_c_string(&recovery)?,
         identifiers: ident_ptrs,
         identifiers_count: ident_count,
         installation_ids: inst_ptrs,
         installation_ids_count: inst_count,
         installation_client_timestamps: ts_ptr,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -475,11 +472,10 @@ pub unsafe extern "C" fn xmtp_client_verify_signed_with_installation_key(
     catch(|| {
         let c = unsafe { ref_from(client)? };
         let text = unsafe { c_str_to_string(text)? };
-        if signature_bytes.is_null() || signature_len != 64 {
-            return Err("signature must be 64 bytes".into());
-        }
-        let sig_slice = unsafe { std::slice::from_raw_parts(signature_bytes, 64) };
-        let sig: [u8; 64] = sig_slice.try_into().map_err(|_| "bad signature length")?;
+        let sig_slice = checked_slice_nonempty(signature_bytes, signature_len)?;
+        let sig: [u8; 64] = sig_slice
+            .try_into()
+            .map_err(|_| "signature must be 64 bytes")?;
 
         let pub_key = c.inner.installation_public_key();
         let pk: [u8; 32] = pub_key
@@ -538,7 +534,7 @@ pub unsafe extern "C" fn xmtp_client_delete_message_by_id(
 /// Get the libxmtp version string. Caller must free with [`xmtp_free_string`].
 #[unsafe(no_mangle)]
 pub extern "C" fn xmtp_libxmtp_version() -> *mut c_char {
-    to_c_string(env!("CARGO_PKG_VERSION"))
+    to_c_string_or_null(env!("CARGO_PKG_VERSION"))
 }
 
 // ---------------------------------------------------------------------------
@@ -612,7 +608,7 @@ pub unsafe extern "C" fn xmtp_client_api_aggregate_statistics(
             let api = c.inner.api_stats();
             let identity = c.inner.identity_api_stats();
             let aggregate = xmtp_proto::api_client::AggregateStats { mls: api, identity };
-            to_c_string(&format!("{:?}", aggregate))
+            to_c_string_or_null(&format!("{:?}", aggregate))
         }
         Err(_) => std::ptr::null_mut(),
     }
@@ -652,7 +648,7 @@ pub unsafe extern "C" fn xmtp_client_get_inbox_id_by_identifier(
         let inbox_id = c.inner.find_inbox_id_from_identifier(&conn, ident).await?;
         unsafe {
             *out = match inbox_id {
-                Some(id) => to_c_string(&id),
+                Some(id) => to_c_string(&id)?,
                 None => std::ptr::null_mut(),
             };
         }
@@ -680,11 +676,11 @@ pub unsafe extern "C" fn xmtp_client_fetch_inbox_states(
         if out.is_null() {
             return Err("null output pointer".into());
         }
-        let mut ids = Vec::with_capacity(count as usize);
-        for i in 0..count as usize {
-            let ptr = unsafe { *inbox_ids.add(i) };
-            ids.push(unsafe { c_str_to_string(ptr)? });
-        }
+        let ids = if inbox_ids.is_null() || count == 0 {
+            Vec::new()
+        } else {
+            unsafe { collect_strings(inbox_ids, count)? }
+        };
         let states = c
             .inner
             .inbox_addresses(
@@ -692,7 +688,10 @@ pub unsafe extern "C" fn xmtp_client_fetch_inbox_states(
                 ids.iter().map(|s| s.as_str()).collect(),
             )
             .await?;
-        let items: Vec<FfiInboxStateItem> = states.iter().map(association_state_to_item).collect();
+        let items: Vec<FfiInboxStateItem> = states
+            .iter()
+            .map(association_state_to_item)
+            .collect::<Result<_, _>>()?;
         unsafe { write_out(out, FfiInboxStateList { items })? };
         Ok(())
     })
@@ -713,7 +712,7 @@ pub unsafe extern "C" fn xmtp_inbox_state_inbox_id(
     match l.items.get(index as usize) {
         Some(item) if !item.inbox_id.is_null() => {
             let s = unsafe { std::ffi::CStr::from_ptr(item.inbox_id) };
-            to_c_string(s.to_str().unwrap_or(""))
+            to_c_string_or_null(s.to_str().unwrap_or(""))
         }
         _ => std::ptr::null_mut(),
     }
@@ -732,7 +731,7 @@ pub unsafe extern "C" fn xmtp_inbox_state_recovery_identifier(
     match l.items.get(index as usize) {
         Some(item) if !item.recovery_identifier.is_null() => {
             let s = unsafe { std::ffi::CStr::from_ptr(item.recovery_identifier) };
-            to_c_string(s.to_str().unwrap_or(""))
+            to_c_string_or_null(s.to_str().unwrap_or(""))
         }
         _ => std::ptr::null_mut(),
     }
@@ -910,11 +909,13 @@ pub unsafe extern "C" fn xmtp_client_fetch_inbox_updates_count(
             .await?;
         let items: Vec<FfiInboxUpdateCount> = counts
             .into_iter()
-            .map(|(id, cnt)| FfiInboxUpdateCount {
-                inbox_id: to_c_string(&id),
-                count: cnt,
+            .map(|(id, cnt)| {
+                Ok(FfiInboxUpdateCount {
+                    inbox_id: to_c_string(&id)?,
+                    count: cnt,
+                })
             })
-            .collect();
+            .collect::<Result<_, Box<dyn std::error::Error>>>()?;
         unsafe { write_out(out, FfiInboxUpdateCountList { items })? };
         Ok(())
     })
@@ -991,23 +992,23 @@ pub unsafe extern "C" fn xmtp_client_fetch_key_package_statuses(
             .map(|(id, result)| match result {
                 Ok(kp) => {
                     let lifetime = kp.life_time();
-                    FfiKeyPackageStatus {
-                        installation_id: to_c_string(&hex::encode(&id)),
+                    Ok(FfiKeyPackageStatus {
+                        installation_id: to_c_string(&hex::encode(&id))?,
                         valid: 1,
                         not_before: lifetime.as_ref().map(|l| l.not_before).unwrap_or(0),
                         not_after: lifetime.as_ref().map(|l| l.not_after).unwrap_or(0),
                         validation_error: std::ptr::null_mut(),
-                    }
+                    })
                 }
-                Err(e) => FfiKeyPackageStatus {
-                    installation_id: to_c_string(&hex::encode(&id)),
+                Err(e) => Ok(FfiKeyPackageStatus {
+                    installation_id: to_c_string(&hex::encode(&id))?,
                     valid: 0,
                     not_before: 0,
                     not_after: 0,
-                    validation_error: to_c_string(&e.to_string()),
-                },
+                    validation_error: to_c_string(&e.to_string())?,
+                }),
             })
-            .collect();
+            .collect::<Result<_, Box<dyn std::error::Error>>>()?;
 
         unsafe { write_out(out, FfiKeyPackageStatusList { items })? };
         Ok(())
@@ -1042,7 +1043,7 @@ pub unsafe extern "C" fn xmtp_key_package_status_list_free(list: *mut FfiKeyPack
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xmtp_client_account_identifier(client: *const FfiClient) -> *mut c_char {
     match unsafe { ref_from(client) } {
-        Ok(c) => to_c_string(&c.account_identifier),
+        Ok(c) => to_c_string_or_null(&c.account_identifier),
         Err(_) => std::ptr::null_mut(),
     }
 }
@@ -1052,7 +1053,7 @@ pub unsafe extern "C" fn xmtp_client_account_identifier(client: *const FfiClient
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xmtp_client_app_version(client: *const FfiClient) -> *mut c_char {
     match unsafe { ref_from(client) } {
-        Ok(c) if !c.app_version.is_empty() => to_c_string(&c.app_version),
+        Ok(c) if !c.app_version.is_empty() => to_c_string_or_null(&c.app_version),
         _ => std::ptr::null_mut(),
     }
 }

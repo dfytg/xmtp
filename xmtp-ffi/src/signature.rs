@@ -143,7 +143,7 @@ pub unsafe extern "C" fn xmtp_signature_request_text(
     match unsafe { ref_from(req) } {
         Ok(r) => {
             let text = runtime().block_on(async { r.request.lock().await.signature_text() });
-            to_c_string(&text)
+            to_c_string_or_null(&text)
         }
         Err(_) => std::ptr::null_mut(),
     }
@@ -158,10 +158,7 @@ pub unsafe extern "C" fn xmtp_signature_request_add_ecdsa(
 ) -> i32 {
     catch_async(|| async {
         let r = unsafe { ref_from(req)? };
-        if signature_bytes.is_null() || signature_len <= 0 {
-            return Err("null or empty signature".into());
-        }
-        let sig = unsafe { std::slice::from_raw_parts(signature_bytes, signature_len as usize) };
+        let sig = checked_slice_nonempty(signature_bytes, signature_len)?;
         let signature =
             xmtp_id::associations::unverified::UnverifiedSignature::new_recoverable_ecdsa(
                 sig.to_vec(),
@@ -189,10 +186,7 @@ pub unsafe extern "C" fn xmtp_signature_request_add_passkey(
     catch_async(|| async {
         let r = unsafe { ref_from(req)? };
         let to_vec = |p: *const u8, len: i32| -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-            if p.is_null() || len <= 0 {
-                return Err("null or empty buffer".into());
-            }
-            Ok(unsafe { std::slice::from_raw_parts(p, len as usize) }.to_vec())
+            Ok(checked_slice_nonempty(p, len)?.to_vec())
         };
         let sig = xmtp_id::associations::unverified::UnverifiedSignature::new_passkey(
             to_vec(public_key, public_key_len)?,
@@ -222,11 +216,7 @@ pub unsafe extern "C" fn xmtp_signature_request_add_scw(
     catch_async(|| async {
         let r = unsafe { ref_from(req)? };
         let addr = unsafe { c_str_to_string(account_address)? };
-        if signature_bytes.is_null() || signature_len <= 0 {
-            return Err("null or empty signature".into());
-        }
-        let sig =
-            unsafe { std::slice::from_raw_parts(signature_bytes, signature_len as usize) }.to_vec();
+        let sig = checked_slice_nonempty(signature_bytes, signature_len)?.to_vec();
         let account_id = xmtp_id::associations::AccountId::new_evm(chain_id, addr);
         let bn = if block_number == 0 {
             None
@@ -282,17 +272,14 @@ pub unsafe extern "C" fn xmtp_client_revoke_installations_signature_request(
 ) -> i32 {
     catch_async(|| async {
         let c = unsafe { ref_from(client)? };
-        if out.is_null() || installation_ids.is_null() || id_lengths.is_null() || count <= 0 {
-            return Err("null pointer or invalid count".into());
+        if out.is_null() {
+            return Err("null output pointer".into());
         }
-        let mut ids = Vec::with_capacity(count as usize);
-        for i in 0..count as usize {
-            let len = unsafe { *id_lengths.add(i) } as usize;
-            let ptr = unsafe { *installation_ids.add(i) };
-            if ptr.is_null() {
-                return Err("null installation ID pointer".into());
-            }
-            ids.push(unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec());
+        let installation_ids = checked_slice_nonempty(installation_ids, count)?;
+        let id_lengths = checked_slice_nonempty(id_lengths, count)?;
+        let mut ids = Vec::with_capacity(installation_ids.len());
+        for i in 0..installation_ids.len() {
+            ids.push(checked_slice_nonempty(installation_ids[i], id_lengths[i])?.to_vec());
         }
         let sig_req = c.inner.identity_updates().revoke_installations(ids).await?;
         let handle = FfiSignatureRequest {
@@ -383,18 +370,10 @@ pub unsafe extern "C" fn xmtp_verify_signed_with_public_key(
 ) -> i32 {
     catch(|| {
         let text = unsafe { c_str_to_string(signature_text)? };
-        if signature_bytes.is_null() || signature_len != 64 {
-            return Err("signature_bytes must be exactly 64 bytes".into());
-        }
-        if public_key.is_null() || public_key_len != 32 {
-            return Err("public_key must be exactly 32 bytes".into());
-        }
-        let sig: [u8; 64] = unsafe { std::slice::from_raw_parts(signature_bytes, 64) }
+        let sig: [u8; 64] = checked_slice_nonempty(signature_bytes, signature_len)?
             .try_into()
-            .map_err(|_| "signature_bytes is not 64 bytes")?;
-        let key: [u8; 32] = unsafe { std::slice::from_raw_parts(public_key, 32) }
-            .try_into()
-            .map_err(|_| "public_key is not 32 bytes")?;
+            .map_err(|_| "signature_bytes must be exactly 64 bytes")?;
+        let key = *checked_key32(public_key, public_key_len)?;
         xmtp_id::associations::verify_signed_with_public_context(text, &sig, &key)?;
         Ok(())
     })

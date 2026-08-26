@@ -3,7 +3,6 @@
 use std::ffi::c_char;
 
 use xmtp_archive::{
-    ENC_KEY_SIZE,
     archive_options::{ArchiveOptions as NativeArchiveOptions, BackupElementSelection},
     exporter::ArchiveExporter,
     importer::ArchiveImporter,
@@ -41,14 +40,9 @@ fn parse_archive_opts(opts: *const FfiArchiveOptions) -> NativeArchiveOptions {
     }
 }
 
-/// Validate and truncate an encryption key to `ENC_KEY_SIZE`.
+/// Validate a 32-byte encryption key.
 fn check_key(key: *const u8, key_len: i32) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    if key.is_null() || (key_len as usize) < ENC_KEY_SIZE {
-        return Err(format!("encryption key must be at least {} bytes", ENC_KEY_SIZE).into());
-    }
-    let mut v = unsafe { std::slice::from_raw_parts(key, key_len as usize) }.to_vec();
-    v.truncate(ENC_KEY_SIZE);
-    Ok(v)
+    Ok(checked_key32(key, key_len)?.to_vec())
 }
 
 // ---------------------------------------------------------------------------
@@ -151,15 +145,15 @@ pub unsafe extern "C" fn xmtp_device_sync_list_available_archives(
                 // Use into_boxed_slice to guarantee cap == len for safe deallocation
                 let inst_boxed = inst.into_boxed_slice();
                 let inst_ptr = Box::into_raw(inst_boxed) as *mut u8;
-                FfiAvailableArchive {
-                    pin: to_c_string(&a.pin),
+                Ok(FfiAvailableArchive {
+                    pin: to_c_string(&a.pin)?,
                     backup_version: a.metadata.backup_version,
                     exported_at_ns: a.metadata.exported_at_ns,
                     sent_by_installation: inst_ptr,
                     sent_by_installation_len: inst_len,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<_, Box<dyn std::error::Error>>>()?;
         unsafe { write_out(out, FfiAvailableArchiveList { items })? };
         Ok(())
     })
