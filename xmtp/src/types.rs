@@ -23,6 +23,35 @@ impl Env {
         }
     }
 
+    /// History-sync (device-sync) server URL.
+    ///
+    /// Copied from libxmtp v1.11.0 `DeviceSyncUrls`. Used by
+    /// [`Client::send_sync_request`](crate::Client::send_sync_request) when no
+    /// override is stored. Not applied automatically on
+    /// [`ClientBuilder::build`](crate::ClientBuilder::build).
+    #[must_use]
+    pub const fn history_sync_url(self) -> &'static str {
+        match self {
+            Self::Local => "http://0.0.0.0:5558",
+            Self::Dev => "https://message-history.dev.ephemera.network",
+            Self::Production => "https://message-history.ephemera.network",
+        }
+    }
+
+    /// Documented d14n gateway URL for this environment.
+    ///
+    /// Unused unless [`ClientBuilder::gateway_host`](crate::ClientBuilder::gateway_host)
+    /// is set — d14n stays off by default. `Env::Dev` maps to the staging payer
+    /// (`GrpcUrls::GATEWAY` under libxmtp `if_dev!`), not `GrpcUrlsDev::GATEWAY`.
+    #[must_use]
+    pub const fn gateway_url(self) -> &'static str {
+        match self {
+            Self::Local => "http://localhost:5052",
+            Self::Dev => "https://payer.testnet-staging.xmtp.network:443",
+            Self::Production => "https://payer.testnet.xmtp.network:443",
+        }
+    }
+
     /// Whether this environment uses TLS.
     #[must_use]
     pub const fn is_secure(self) -> bool {
@@ -584,6 +613,32 @@ mod tests {
         assert_eq!(
             Env::Production.url(),
             "https://grpc.production.xmtp.network:443"
+        );
+    }
+
+    #[test]
+    fn env_history_sync_url_copies_device_sync_urls_v1_11_0() {
+        assert_eq!(Env::Local.history_sync_url(), "http://0.0.0.0:5558");
+        assert_eq!(
+            Env::Dev.history_sync_url(),
+            "https://message-history.dev.ephemera.network"
+        );
+        assert_eq!(
+            Env::Production.history_sync_url(),
+            "https://message-history.ephemera.network"
+        );
+    }
+
+    #[test]
+    fn env_gateway_url_is_documented_staging_for_dev() {
+        assert_eq!(Env::Local.gateway_url(), "http://localhost:5052");
+        assert_eq!(
+            Env::Dev.gateway_url(),
+            "https://payer.testnet-staging.xmtp.network:443"
+        );
+        assert_eq!(
+            Env::Production.gateway_url(),
+            "https://payer.testnet.xmtp.network:443"
         );
     }
 

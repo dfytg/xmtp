@@ -16,6 +16,7 @@
     reason = "FFI boundary casts are systematic and bounds-checked; every public function follows the same error pattern"
 )]
 
+pub mod archive;
 pub mod client;
 pub mod conversation;
 pub mod error;
@@ -39,7 +40,8 @@ mod ledger;
 mod ens;
 
 // Re-export core public API at crate root.
-pub use client::{Client, ClientBuilder};
+pub use archive::{ArchiveMetadata, ArchiveOptions, AvailableArchive, archive_metadata};
+pub use client::{AuthHandle, Client, ClientBuilder};
 // Re-export standalone functions.
 pub use client::{
     generate_inbox_id, get_inbox_id_for_identifier, init_logger, is_address_authorized,
