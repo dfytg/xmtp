@@ -58,11 +58,10 @@ pub unsafe extern "C" fn xmtp_client_create(
             return Err("null output pointer".into());
         }
 
-        let host = unsafe { c_str_to_string(opts.host)? };
+        let host = host_with_scheme(unsafe { c_str_to_string(opts.host)? }, opts.is_secure != 0);
         let inbox_id = unsafe { c_str_to_string(opts.inbox_id)? };
         let ident_str = unsafe { c_str_to_string(opts.account_identifier)? };
         let ident_str_saved = ident_str.clone();
-        let is_secure = opts.is_secure != 0;
         let app_version_str = unsafe { c_str_to_option(opts.app_version)? }.unwrap_or_default();
         let nonce = if opts.nonce == 0 { 1 } else { opts.nonce };
 
@@ -75,7 +74,7 @@ pub unsafe extern "C" fn xmtp_client_create(
 
         // Build API backend
         let mut backend = xmtp_api_d14n::MessageBackendBuilder::default();
-        backend.v3_host(&host).is_secure(is_secure);
+        backend.v3_host(&host);
 
         // Optional gateway host (enables d14n)
         let gateway_host = unsafe { c_str_to_option(opts.gateway_host)? };
@@ -144,14 +143,11 @@ pub unsafe extern "C" fn xmtp_client_create(
         let cursor_store = xmtp_mls::cursor_store::SqliteCursorStore::new(store.db());
         backend.cursor_store(cursor_store);
 
-        let api_client = backend.clone().build()?;
-        let sync_api_client = backend.build()?;
+        let api_client = backend.build_optional_d14n()?;
 
-        // Build client
         let mut builder = xmtp_mls::Client::builder(identity_strategy)
-            .api_clients(api_client, sync_api_client)
+            .api_client(api_client)
             .enable_api_stats()?
-            .enable_api_debug_wrapper()?
             .with_remote_verifier()?
             .with_allow_offline(if opts.allow_offline != 0 {
                 Some(true)

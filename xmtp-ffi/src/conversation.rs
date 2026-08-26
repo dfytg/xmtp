@@ -102,6 +102,7 @@ pub unsafe extern "C" fn xmtp_conversation_send(
             let o = unsafe { &*opts };
             xmtp_mls::groups::send_message_opts::SendMessageOpts {
                 should_push: o.should_push != 0,
+                idempotency_key: None,
             }
         };
         let msg_id = c.inner.send_message(bytes, send_opts).await?;
@@ -135,6 +136,7 @@ pub unsafe extern "C" fn xmtp_conversation_send_optimistic(
             let o = unsafe { &*opts };
             xmtp_mls::groups::send_message_opts::SendMessageOpts {
                 should_push: o.should_push != 0,
+                idempotency_key: None,
             }
         };
         let msg_id = c.inner.send_message_optimistic(bytes, send_opts)?;
@@ -174,7 +176,7 @@ pub unsafe extern "C" fn xmtp_conversation_prepare_message(
         let bytes = checked_slice_nonempty(content_bytes, content_len)?;
         let msg_id = c
             .inner
-            .prepare_message_for_later_publish(bytes, should_push != 0)?;
+            .prepare_message_for_later_publish(bytes, should_push != 0, None)?;
         if !out_id.is_null() {
             unsafe {
                 *out_id = to_c_string(&hex::encode(&msg_id))?;
@@ -1226,14 +1228,14 @@ pub unsafe extern "C" fn xmtp_conversation_hmac_keys(
         if let Ok(dups) = c.inner.find_duplicate_dms() {
             for dup in dups {
                 if let Ok(keys) = dup.hmac_keys(-1..=1) {
-                    entries.push(hmac_keys_to_entry(&dup.group_id, keys)?);
+                    entries.push(hmac_keys_to_entry(dup.group_id.as_slice(), keys)?);
                 }
             }
         }
 
         // Include this conversation
         let keys = c.inner.hmac_keys(-1..=1)?;
-        entries.push(hmac_keys_to_entry(&c.inner.group_id, keys)?);
+        entries.push(hmac_keys_to_entry(c.inner.group_id.as_slice(), keys)?);
 
         unsafe { write_out(out, FfiHmacKeyMap { entries })? };
         Ok(())

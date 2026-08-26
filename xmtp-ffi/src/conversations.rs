@@ -228,7 +228,7 @@ pub unsafe extern "C" fn xmtp_client_get_conversation_by_id(
             return Err("null output pointer".into());
         }
         let id_str = unsafe { c_str_to_string(hex_id)? };
-        let group_id = hex::decode(&id_str)?;
+        let group_id = xmtp_proto::types::GroupId::try_from(hex::decode(&id_str)?)?;
         let group = c.inner.stitched_group(&group_id)?;
         unsafe { write_out(out, FfiConversation { inner: group })? };
         Ok(())
@@ -490,7 +490,7 @@ pub unsafe extern "C" fn xmtp_client_hmac_keys(
         for conv in conversations {
             if let Ok(keys) = conv.hmac_keys(-1..=1) {
                 entries.push(crate::conversation::hmac_keys_to_entry(
-                    &conv.group_id,
+                    conv.group_id.as_slice(),
                     keys,
                 )?);
             }

@@ -42,7 +42,7 @@ pub unsafe extern "C" fn xmtp_is_installation_authorized(
         if out.is_null() {
             return Err("null output pointer".into());
         }
-        let url = unsafe { c_str_to_string(api_url)? };
+        let url = host_with_scheme(unsafe { c_str_to_string(api_url)? }, is_secure != 0);
         let inbox = unsafe { c_str_to_string(inbox_id)? };
         let id_bytes = checked_slice_nonempty(installation_id, installation_id_len)?.to_vec();
 
@@ -50,8 +50,7 @@ pub unsafe extern "C" fn xmtp_is_installation_authorized(
 
         let backend = xmtp_api_d14n::MessageBackendBuilder::default()
             .v3_host(&url)
-            .is_secure(is_secure != 0)
-            .build()?;
+            .build_v3()?;
         let backend = xmtp_api_d14n::TrackedStatsClient::new(backend);
         let api = xmtp_api::ApiClientWrapper::new(std::sync::Arc::new(backend), Default::default());
 
@@ -78,7 +77,7 @@ pub unsafe extern "C" fn xmtp_is_address_authorized(
         if out.is_null() {
             return Err("null output pointer".into());
         }
-        let url = unsafe { c_str_to_string(api_url)? };
+        let url = host_with_scheme(unsafe { c_str_to_string(api_url)? }, is_secure != 0);
         let inbox = unsafe { c_str_to_string(inbox_id)? };
         let addr = unsafe { c_str_to_string(address)? };
 
@@ -86,8 +85,7 @@ pub unsafe extern "C" fn xmtp_is_address_authorized(
 
         let backend = xmtp_api_d14n::MessageBackendBuilder::default()
             .v3_host(&url)
-            .is_secure(is_secure != 0)
-            .build()?;
+            .build_v3()?;
         let backend = xmtp_api_d14n::TrackedStatsClient::new(backend);
         let api = xmtp_api::ApiClientWrapper::new(std::sync::Arc::new(backend), Default::default());
 
@@ -116,13 +114,12 @@ pub unsafe extern "C" fn xmtp_get_inbox_id_for_identifier(
         if out.is_null() {
             return Err("null output pointer".into());
         }
-        let url = unsafe { c_str_to_string(api_url)? };
+        let url = host_with_scheme(unsafe { c_str_to_string(api_url)? }, is_secure != 0);
         let ident = unsafe { parse_identifier(identifier, identifier_kind)? };
 
         let backend = xmtp_api_d14n::MessageBackendBuilder::default()
             .v3_host(&url)
-            .is_secure(is_secure != 0)
-            .build()?;
+            .build_v3()?;
         let backend = xmtp_api_d14n::TrackedStatsClient::new(backend);
         let api = xmtp_api::ApiClientWrapper::new(std::sync::Arc::new(backend), Default::default());
 

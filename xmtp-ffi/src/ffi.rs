@@ -826,6 +826,17 @@ pub(crate) unsafe fn c_str_to_option(
     Ok(Some(unsafe { CStr::from_ptr(s) }.to_str()?.to_owned()))
 }
 
+/// libxmtp infers TLS from the URL scheme. Prefix when the host has none.
+pub(crate) fn host_with_scheme(host: String, is_secure: bool) -> String {
+    if host.contains("://") {
+        host
+    } else if is_secure {
+        format!("https://{host}")
+    } else {
+        format!("http://{host}")
+    }
+}
+
 /// Untrusted C buffer. Null or negative → Err. `len == 0` → Ok(&[]).
 /// Never `as usize` on a negative i32.
 pub(crate) fn checked_slice<'a, T>(
@@ -1412,6 +1423,26 @@ mod tests {
         assert!(to_c_string("bad\0nul").is_err());
         assert!(to_c_string_or_null("bad\0nul").is_null());
         assert!(xmtp_last_error_length() > 0);
+    }
+
+    #[test]
+    fn host_with_scheme_prefixes_when_missing() {
+        assert_eq!(
+            host_with_scheme("grpc.example:443".into(), true),
+            "https://grpc.example:443"
+        );
+        assert_eq!(
+            host_with_scheme("localhost:5556".into(), false),
+            "http://localhost:5556"
+        );
+        assert_eq!(
+            host_with_scheme("https://grpc.example:443".into(), false),
+            "https://grpc.example:443"
+        );
+        assert_eq!(
+            host_with_scheme("http://localhost:5556".into(), true),
+            "http://localhost:5556"
+        );
     }
 
     #[test]

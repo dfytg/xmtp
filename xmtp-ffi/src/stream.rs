@@ -384,7 +384,6 @@ pub unsafe extern "C" fn xmtp_stream_preferences(
 
 /// Stream message deletion events. Callback receives a borrowed hex message ID
 /// (`*const c_char`) — valid only during the callback invocation.
-/// Now includes `on_close` for API consistency with other stream functions.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xmtp_stream_message_deletions(
     client: *const FfiClient,
@@ -405,45 +404,19 @@ pub unsafe extern "C" fn xmtp_stream_message_deletions(
         let g1 = guard.clone();
         let g2 = guard;
 
-        let mut handle =
-            MlsClient::stream_message_deletions_with_callback(c.inner.clone(), move |result| {
-                match result {
-                    Ok(decoded) => {
-                        let id_hex = hex::encode(&decoded.metadata.id);
-                        let c_str = std::ffi::CString::new(id_hex).unwrap_or_default();
-                        unsafe { callback(c_str.as_ptr(), ctx as *mut c_void) };
-                    }
-                    Err(e) => invoke_on_close_err(on_close, ctx, &e.to_string(), &g1),
+        let handle = MlsClient::stream_message_deletions_with_callback(
+            c.inner.clone(),
+            move |result| match result {
+                Ok(decoded) => {
+                    let id_hex = hex::encode(&decoded.metadata.id);
+                    let c_str = std::ffi::CString::new(id_hex).unwrap_or_default();
+                    unsafe { callback(c_str.as_ptr(), ctx as *mut c_void) };
                 }
-            });
-
-        runtime().block_on(handle.wait_for_ready());
-        let abort = handle.abort_handle();
-        let abort_arc = Arc::new(abort);
-        let abort_monitor = Arc::clone(&abort_arc);
-
-        // The upstream API lacks a close callback parameter, so we spawn a
-        // lightweight task that polls `is_finished` and fires `on_close`
-        // once the stream terminates (via `xmtp_stream_end` or fatal error).
-        runtime().spawn(async move {
-            loop {
-                if abort_monitor.is_finished() {
-                    invoke_on_close_ok(on_close, ctx, &g2);
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-        });
-
-        unsafe {
-            write_out(
-                out,
-                FfiStreamHandle {
-                    abort: abort_arc,
-                    join: std::sync::Mutex::new(Some(Box::new(handle))),
-                },
-            )
-        }
+                Err(e) => invoke_on_close_err(on_close, ctx, &e.to_string(), &g1),
+            },
+            move || invoke_on_close_ok(on_close, ctx, &g2),
+        );
+        finalize_stream(handle, out)
     })
 }
 
