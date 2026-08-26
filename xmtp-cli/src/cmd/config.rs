@@ -89,19 +89,37 @@ pub(crate) fn read_key32(path: &Path) -> xmtp::Result<[u8; 32]> {
     })
 }
 
-/// Load `db.key` for a profile. Missing file is a hard error (no plaintext DBs).
-pub(crate) fn load_db_key(profile: &str) -> xmtp::Result<[u8; 32]> {
-    let path = profile_dir(profile).join("db.key");
-    if !path.exists() {
+/// Load `db.key` from `dir`. Unencrypted wording only when the directory exists.
+pub(crate) fn load_db_key_at(dir: &Path, profile: &str) -> xmtp::Result<[u8; 32]> {
+    let path = dir.join("db.key");
+    if path.exists() {
+        return read_key32(&path);
+    }
+    if dir.exists() {
         return Err(xmtp::XmtpError::InvalidArgument(format!(
             "profile '{profile}' is missing db.key; unencrypted profiles are not supported"
         )));
     }
-    read_key32(&path)
+    Err(xmtp::XmtpError::Io(format!(
+        "load config: profile '{profile}' does not exist"
+    )))
+}
+
+/// Load `db.key` for a profile. Missing file is a hard error (no plaintext DBs).
+pub(crate) fn load_db_key(profile: &str) -> xmtp::Result<[u8; 32]> {
+    load_db_key_at(&profile_dir(profile), profile)
 }
 
 /// Create a profile directory (0700) and generate `db.key` (0600).
+///
+/// Fails if `dir` already exists so a leftover DB is never re-keyed.
 pub(crate) fn init_profile_dir(dir: &Path) -> xmtp::Result<[u8; 32]> {
+    if dir.exists() {
+        return Err(xmtp::XmtpError::InvalidArgument(format!(
+            "profile directory {} already exists; remove it first with `xmtp remove`",
+            dir.display()
+        )));
+    }
     mkdir_secret(dir)?;
     let key = random_key32()?;
     write_secret(&dir.join("db.key"), &key)?;
@@ -348,6 +366,21 @@ mod tests {
     }
 
     #[test]
+    fn init_profile_dir_does_not_overwrite_existing() {
+        let tmp = Tmp::new();
+        let dir = tmp.path().join("alice");
+        let key = init_profile_dir(&dir).expect("init");
+        let err = init_profile_dir(&dir).expect_err("exists");
+        assert!(
+            err.to_string().contains("already exists"),
+            "{}",
+            err.to_string()
+        );
+        let got = read_key32(&dir.join("db.key")).expect("read db.key");
+        assert_eq!(got, key, "db.key not overwritten");
+    }
+
+    #[test]
     fn write_secret_identity_key_is_0600() {
         let tmp = Tmp::new();
         let path = tmp.path().join("identity.key");
@@ -364,11 +397,24 @@ mod tests {
     }
 
     #[test]
-    fn missing_db_key_is_hard_error() {
-        let err = load_db_key("___xmtp_cli_no_such_profile___").expect_err("missing");
+    fn missing_db_key_on_existing_dir_is_unencrypted_error() {
+        let tmp = Tmp::new();
+        let dir = tmp.path().join("alice");
+        fs::create_dir(&dir).expect("mkdir");
+        let err = load_db_key_at(&dir, "alice").expect_err("missing key");
         let msg = err.to_string();
         assert!(msg.contains("db.key"), "{msg}");
         assert!(msg.contains("unencrypted"), "{msg}");
+    }
+
+    #[test]
+    fn missing_profile_dir_is_not_unencrypted_error() {
+        let tmp = Tmp::new();
+        let dir = tmp.path().join("nope");
+        let err = load_db_key_at(&dir, "nope").expect_err("missing dir");
+        let msg = err.to_string();
+        assert!(!msg.contains("unencrypted"), "{msg}");
+        assert!(msg.contains("does not exist"), "{msg}");
     }
 
     #[test]

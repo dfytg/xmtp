@@ -464,7 +464,13 @@ fn path_as_str(path: &Path) -> xmtp::Result<&str> {
 }
 
 fn archive_key(profile: &str, key_hex: Option<&str>) -> xmtp::Result<[u8; 32]> {
-    key_hex.map_or_else(|| config::load_db_key(profile), config::parse_hex32)
+    key_hex.map_or_else(
+        || {
+            drop(config::ProfileConfig::load(profile)?);
+            config::load_db_key(profile)
+        },
+        config::parse_hex32,
+    )
 }
 
 /// `xmtp sync [--history-url URL] [--json]`

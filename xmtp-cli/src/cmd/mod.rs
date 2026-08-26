@@ -349,10 +349,6 @@ pub(crate) struct NewArgs {
     #[arg(long, conflicts_with_all = ["import", "ledger"])]
     pub key: Option<PathBuf>,
 
-    /// Copy a database file into the profile.
-    #[arg(long)]
-    pub db: Option<PathBuf>,
-
     /// Use a Ledger hardware wallet (optionally specify account index, default 0).
     #[arg(long, num_args = 0..=1, default_missing_value = "0",
           conflicts_with_all = ["import", "key"])]

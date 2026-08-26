@@ -14,10 +14,10 @@ use crate::decode;
 /// Returns the config (with address) and a ready-to-use client.
 pub(crate) fn create(args: &NewArgs) -> xmtp::Result<(ProfileConfig, Client)> {
     let dir = config::profile_dir(&args.name);
-    if dir.join("profile.conf").exists() {
+    if dir.exists() {
         return Err(xmtp::XmtpError::InvalidArgument(format!(
-            "profile '{}' already exists",
-            args.name
+            "profile '{}' already exists; remove it first with `xmtp remove {}`",
+            args.name, args.name
         )));
     }
 
@@ -40,11 +40,6 @@ pub(crate) fn create(args: &NewArgs) -> xmtp::Result<(ProfileConfig, Client)> {
         }
         (SignerKind::File, Box::new(load_or_create_key(&key_path)?))
     };
-
-    // Copy database if provided.
-    if let Some(ref src) = args.db {
-        fs::copy(src, &db_path).map_err(|e| xmtp::XmtpError::Io(format!("copy db: {e}")))?;
-    }
 
     // Register with the XMTP network.
     let address = signer.identifier().address;

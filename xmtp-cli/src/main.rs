@@ -73,7 +73,6 @@ fn run(cli: Cli) -> xmtp::Result<()> {
             rpc_url: xmtp::DEFAULT_RPC.into(),
             import: None,
             key: None,
-            db: None,
             ledger: None,
         })?;
     }
