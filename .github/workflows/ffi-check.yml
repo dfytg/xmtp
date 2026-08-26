@@ -1,0 +1,112 @@
+name: FFI check
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "xmtp-ffi/**"
+      - ".github/workflows/ffi-check.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "xmtp-ffi/**"
+      - ".github/workflows/ffi-check.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Must match Makefile NIGHTLY (cbindgen parse.expand).
+  NIGHTLY: nightly-2026-08-03
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@1.97.1
+
+      - uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: "v0.10.0"
+
+      - name: libxmtp tag
+        id: libxmtp
+        run: |
+          tag=$(sed -n 's/.*tag = "\([^"]*\)".*/\1/p' xmtp-ffi/Cargo.toml | head -1)
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: xmtp-ffi
+          key: ${{ steps.libxmtp.outputs.tag }}
+
+      - name: cargo +1.97.1 check
+        run: cargo +1.97.1 check --manifest-path xmtp-ffi/Cargo.toml
+
+  deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@1.97.1
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: cargo deny (workspace + xmtp-ffi)
+        run: |
+          cargo deny --manifest-path xmtp-sys/Cargo.toml check
+          cargo deny --manifest-path xmtp-ffi/Cargo.toml check --config xmtp-ffi/deny.toml
+
+  header:
+    name: header dirty
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.NIGHTLY }}
+
+      - uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: "v0.10.0"
+
+      - name: libxmtp tag
+        id: libxmtp
+        run: |
+          tag=$(sed -n 's/.*tag = "\([^"]*\)".*/\1/p' xmtp-ffi/Cargo.toml | head -1)
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: xmtp-ffi
+          key: header-${{ steps.libxmtp.outputs.tag }}
+
+      - name: Regenerated header matches committed
+        run: |
+          make header NIGHTLY="$NIGHTLY"
+          git diff --exit-code xmtp-ffi/include/xmtp_ffi.h
