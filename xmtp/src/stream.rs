@@ -68,20 +68,9 @@ impl<T> Drop for Subscription<T> {
     fn drop(&mut self) {
         // SAFETY: `self.handle` is a valid stream handle; safe to call multiple times.
         unsafe { xmtp_sys::xmtp_stream_end(self.handle.as_ptr()) };
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !self.is_closed() && std::time::Instant::now() < deadline {
-            #[allow(
-                clippy::disallowed_methods,
-                reason = "sync Drop cannot await; bounded poll before leak-or-free"
-            )]
-            {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-        }
-
-        if !self.is_closed() {
-            // `_ctx` is named for drop-order; take it so a live worker cannot UAF.
+        // SAFETY: join takes the task via `*mut`; handle is still freed on field drop.
+        let join_rc = unsafe { xmtp_sys::xmtp_stream_join(self.handle.as_mut_ptr()) };
+        if join_rc != 0 {
             #[allow(
                 clippy::used_underscore_binding,
                 reason = "field is owned for lifetime; take on timeout to leak"

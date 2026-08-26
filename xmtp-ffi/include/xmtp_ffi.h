@@ -287,6 +287,10 @@ typedef struct XmtpFfiClientOptions {
      * Minimum database connection pool size. 0 = use default.
      */
     uint32_t min_db_pool_size;
+    /**
+     * Byte length of `encryption_key`. 0 if `encryption_key` is null, else 32.
+     */
+    int32_t encryption_key_len;
 } XmtpFfiClientOptions;
 
 /**
@@ -762,6 +766,11 @@ int32_t xmtp_last_error_length(void);
  * or -1 if `buf` is null or too small.
  */
 int32_t xmtp_last_error_message(char *buf, int32_t buf_len);
+
+/**
+ * Drop the process-global tokio runtime (cdylib unload). Further FFI calls recreate it.
+ */
+void xmtp_shutdown(void);
 
 /**
  * Free a string previously returned by this library.
@@ -1704,7 +1713,7 @@ void xmtp_available_archive_list_free(struct XmtpFfiAvailableArchiveList *list);
 
 /**
  * Export an archive to a local file.
- * `key` must be at least 32 bytes (encryption key).
+ * `key` must be exactly 32 bytes (encryption key).
  */
 int32_t xmtp_device_sync_create_archive(const struct XmtpFfiClient *client,
                                         const char *path,
@@ -1714,7 +1723,7 @@ int32_t xmtp_device_sync_create_archive(const struct XmtpFfiClient *client,
 
 /**
  * Import a previously exported archive from a file.
- * `key` must be at least 32 bytes (encryption key).
+ * `key` must be exactly 32 bytes (encryption key).
  */
 int32_t xmtp_device_sync_import_archive(const struct XmtpFfiClient *client,
                                         const char *path,
@@ -1907,7 +1916,7 @@ int32_t xmtp_verify_signed_with_public_key(const char *signature_text,
 /**
  * Stream new conversations. Callback receives owned `*mut FfiConversation` (caller must free).
  * `on_close(error, ctx)`: null error = normal close; non-null = borrowed error string.
- * Caller must end with `xmtp_stream_end` and free with `xmtp_stream_free`.
+ * Caller must `xmtp_stream_end`, `xmtp_stream_join`, then `xmtp_stream_free`.
  */
 int32_t xmtp_stream_conversations(const struct XmtpFfiClient *client,
                                   int32_t conversation_type,
@@ -1961,7 +1970,6 @@ int32_t xmtp_stream_preferences(const struct XmtpFfiClient *client,
 /**
  * Stream message deletion events. Callback receives a borrowed hex message ID
  * (`*const c_char`) — valid only during the callback invocation.
- * Now includes `on_close` for API consistency with other stream functions.
  */
 int32_t xmtp_stream_message_deletions(const struct XmtpFfiClient *client,
                                       XmtpFnMessageDeletionCallback callback,
@@ -1981,8 +1989,18 @@ void xmtp_stream_end(const struct XmtpFfiStreamHandle *handle);
 int32_t xmtp_stream_is_closed(const struct XmtpFfiStreamHandle *handle);
 
 /**
+ * Wait for the stream worker. Does not free the handle.
+ *
+ * Takes the joinable task out of `handle`. Returns 0 if the worker finished
+ * (or was already joined). On timeout, leaks the remaining task so callbacks
+ * may still run; does not free.
+ */
+int32_t xmtp_stream_join(struct XmtpFfiStreamHandle *handle);
+
+/**
  * Free a stream handle. Must be called after `xmtp_stream_end`.
  * Calling this on an active (non-ended) stream will also end it.
+ * Does not wait. If join was skipped, the remaining task is leaked.
  */
 void xmtp_stream_free(struct XmtpFfiStreamHandle *handle);
 

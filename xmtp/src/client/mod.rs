@@ -595,6 +595,7 @@ impl ClientBuilder {
             client_mode: i32::from(self.notification_mode),
             max_db_pool_size: 0,
             min_db_pool_size: 0,
+            encryption_key_len: if self.encryption_key.is_some() { 32 } else { 0 },
         };
 
         let mut raw: *mut xmtp_sys::XmtpFfiClient = ptr::null_mut();

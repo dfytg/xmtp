@@ -44,6 +44,8 @@ pub struct FfiClientOptions {
     pub max_db_pool_size: u32,
     /// Minimum database connection pool size. 0 = use default.
     pub min_db_pool_size: u32,
+    /// Byte length of `encryption_key`. 0 if `encryption_key` is null, else 32.
+    pub encryption_key_len: i32,
 }
 
 /// Create a new XMTP client. Caller must free with [`xmtp_client_free`].
@@ -109,7 +111,7 @@ pub unsafe extern "C" fn xmtp_client_create(
         let enc_key: Option<xmtp_db::EncryptionKey> = if opts.encryption_key.is_null() {
             None
         } else {
-            Some((*checked_key32(opts.encryption_key, 32)?).into())
+            Some((*checked_key32(opts.encryption_key, opts.encryption_key_len)?).into())
         };
 
         // Build NativeDb — pool size and encryption methods use typestate,
@@ -1052,5 +1054,60 @@ pub unsafe extern "C" fn xmtp_client_app_version(client: *const FfiClient) -> *m
     match unsafe { ref_from(client) } {
         Ok(c) if !c.app_version.is_empty() => to_c_string_or_null(&c.app_version),
         _ => std::ptr::null_mut(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ptr;
+
+    use super::*;
+
+    fn cstr(s: impl Into<Vec<u8>>) -> CString {
+        CString::new(s.into()).unwrap()
+    }
+
+    fn opts_with_key(
+        key: &[u8],
+        len: i32,
+        host: &CString,
+        inbox: &CString,
+        account: &CString,
+    ) -> FfiClientOptions {
+        FfiClientOptions {
+            host: host.as_ptr(),
+            gateway_host: ptr::null(),
+            is_secure: 0,
+            db_path: ptr::null(),
+            encryption_key: key.as_ptr(),
+            inbox_id: inbox.as_ptr(),
+            account_identifier: account.as_ptr(),
+            identifier_kind: 0,
+            nonce: 1,
+            auth_handle: ptr::null(),
+            app_version: ptr::null(),
+            device_sync_worker_mode: 1,
+            allow_offline: 1,
+            client_mode: 0,
+            max_db_pool_size: 0,
+            min_db_pool_size: 0,
+            encryption_key_len: len,
+        }
+    }
+
+    #[test]
+    fn encryption_key_len_not_32_returns_error() {
+        let host = cstr("http://localhost:5556");
+        let inbox = cstr("a".repeat(64));
+        let account = cstr("0x0000000000000000000000000000000000000001");
+        let key = [0u8; 32];
+        for len in [0, 16, 31, 33] {
+            let opts = opts_with_key(&key, len, &host, &inbox, &account);
+            let mut out: *mut FfiClient = ptr::null_mut();
+            let rc = unsafe { xmtp_client_create(&opts, &raw mut out) };
+            assert_eq!(rc, -1, "len={len}");
+            assert!(xmtp_last_error_length() > 0, "len={len}");
+            assert!(out.is_null(), "len={len}");
+        }
     }
 }

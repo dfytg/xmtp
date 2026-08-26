@@ -7,18 +7,22 @@
 //!
 //! # Lifecycle
 //! `xmtp_stream_end(handle)` → signal stop.
-//! `xmtp_stream_is_closed(handle)` → poll status.
-//! `xmtp_stream_free(handle)` → release handle memory.
+//! `xmtp_stream_join(handle)` → wait for the worker (timeout leaks the task).
+//! `xmtp_stream_free(handle)` → release handle memory; does not wait.
 
 use std::ffi::{c_char, c_void};
+use std::mem::ManuallyDrop;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use xmtp_common::StreamHandle;
 use xmtp_mls::Client as MlsClient;
 use xmtp_mls::groups::MlsGroup;
 
 use crate::ffi::*;
+
+const JOIN_TIMEOUT: Duration = Duration::from_millis(if cfg!(test) { 200 } else { 5_000 });
 
 /// Nullable on-close callback passed to stream functions.
 ///
@@ -47,8 +51,30 @@ fn parse_conv_type(v: i32) -> Option<xmtp_db::group::ConversationType> {
         0 => Some(xmtp_db::group::ConversationType::Dm),
         1 => Some(xmtp_db::group::ConversationType::Group),
         2 => Some(xmtp_db::group::ConversationType::Sync),
+        3 => Some(xmtp_db::group::ConversationType::Oneshot),
         _ => None,
     }
+}
+
+fn take_join_task(h: &FfiStreamHandle) -> Option<FfiJoinHandle> {
+    h.join
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+}
+
+fn leak_join_task(task: FfiJoinHandle) {
+    let _leaked = ManuallyDrop::new(task);
+}
+
+/// `true` if the wait hit `JOIN_TIMEOUT`.
+fn stream_join_timed_out(task: &mut FfiJoinHandle) -> bool {
+    let fut = async { tokio::time::timeout(JOIN_TIMEOUT, task.end_and_wait()).await };
+    let result = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
+        Err(_) => runtime().block_on(fut),
+    };
+    result.is_err()
 }
 
 /// Guard ensuring `on_close` is called at most once across data-error and close paths.
@@ -111,7 +137,7 @@ where
 
 /// Stream new conversations. Callback receives owned `*mut FfiConversation` (caller must free).
 /// `on_close(error, ctx)`: null error = normal close; non-null = borrowed error string.
-/// Caller must end with `xmtp_stream_end` and free with `xmtp_stream_free`.
+/// Caller must `xmtp_stream_end`, `xmtp_stream_join`, then `xmtp_stream_free`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xmtp_stream_conversations(
     client: *const FfiClient,
@@ -442,13 +468,203 @@ pub unsafe extern "C" fn xmtp_stream_is_closed(handle: *const FfiStreamHandle) -
     }
 }
 
+/// Wait for the stream worker. Does not free the handle.
+///
+/// Takes the joinable task out of `handle`. Returns 0 if the worker finished
+/// (or was already joined). On timeout, leaks the remaining task so callbacks
+/// may still run; does not free.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xmtp_stream_join(handle: *mut FfiStreamHandle) -> i32 {
+    catch(|| {
+        let h = unsafe { mut_from(handle)? };
+        let Some(mut task) = take_join_task(h) else {
+            return Ok(());
+        };
+        if stream_join_timed_out(&mut task) {
+            leak_join_task(task);
+            return Err("stream join timed out".into());
+        }
+        Ok(())
+    })
+}
+
 /// Free a stream handle. Must be called after `xmtp_stream_end`.
 /// Calling this on an active (non-ended) stream will also end it.
-/// Does not wait for the worker (`JoinHandle` drop detaches).
+/// Does not wait. If join was skipped, the remaining task is leaked.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xmtp_stream_free(handle: *mut FfiStreamHandle) {
-    if !handle.is_null() {
-        let h = unsafe { Box::from_raw(handle) };
-        h.abort.end();
+    if handle.is_null() {
+        return;
+    }
+    let h = unsafe { Box::from_raw(handle) };
+    h.abort.end();
+    if let Some(task) = take_join_task(&h) {
+        leak_join_task(task);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Instant;
+
+    use xmtp_common::{AbortHandle, StreamHandle, StreamHandleError};
+
+    use super::*;
+
+    type Out = Result<(), xmtp_mls::subscriptions::SubscribeError>;
+
+    struct DummyAbort {
+        finished: bool,
+    }
+
+    impl AbortHandle for DummyAbort {
+        fn end(&self) {}
+        fn is_finished(&self) -> bool {
+            self.finished
+        }
+    }
+
+    struct SleepHandle {
+        delay: Duration,
+        done: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl StreamHandle for SleepHandle {
+        type StreamOutput = Out;
+        async fn wait_for_ready(&mut self) {}
+        fn end(&self) {}
+        async fn join(self) -> Result<Self::StreamOutput, StreamHandleError> {
+            tokio::time::sleep(self.delay).await;
+            self.done.store(true, Ordering::SeqCst);
+            Ok(Ok(()))
+        }
+        async fn end_and_wait(&mut self) -> Result<Self::StreamOutput, StreamHandleError> {
+            tokio::time::sleep(self.delay).await;
+            self.done.store(true, Ordering::SeqCst);
+            Ok(Ok(()))
+        }
+        fn abort_handle(&self) -> Box<dyn AbortHandle> {
+            Box::new(DummyAbort { finished: false })
+        }
+    }
+
+    struct HangHandle;
+
+    #[async_trait::async_trait]
+    impl StreamHandle for HangHandle {
+        type StreamOutput = Out;
+        async fn wait_for_ready(&mut self) {}
+        fn end(&self) {}
+        async fn join(self) -> Result<Self::StreamOutput, StreamHandleError> {
+            std::future::pending().await
+        }
+        async fn end_and_wait(&mut self) -> Result<Self::StreamOutput, StreamHandleError> {
+            std::future::pending().await
+        }
+        fn abort_handle(&self) -> Box<dyn AbortHandle> {
+            Box::new(DummyAbort { finished: false })
+        }
+    }
+
+    struct FlagThenHang {
+        flag: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl StreamHandle for FlagThenHang {
+        type StreamOutput = Out;
+        async fn wait_for_ready(&mut self) {}
+        fn end(&self) {}
+        async fn join(self) -> Result<Self::StreamOutput, StreamHandleError> {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            self.flag.store(true, Ordering::SeqCst);
+            std::future::pending().await
+        }
+        async fn end_and_wait(&mut self) -> Result<Self::StreamOutput, StreamHandleError> {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            self.flag.store(true, Ordering::SeqCst);
+            std::future::pending().await
+        }
+        fn abort_handle(&self) -> Box<dyn AbortHandle> {
+            Box::new(DummyAbort { finished: false })
+        }
+    }
+
+    fn wrap(task: FfiJoinHandle) -> *mut FfiStreamHandle {
+        into_raw(FfiStreamHandle {
+            abort: Arc::new(Box::new(DummyAbort { finished: false })),
+            join: Mutex::new(Some(task)),
+        })
+    }
+
+    #[test]
+    fn parse_conv_type_oneshot() {
+        assert_eq!(
+            parse_conv_type(3),
+            Some(xmtp_db::group::ConversationType::Oneshot)
+        );
+        assert_eq!(
+            parse_conv_type(0),
+            Some(xmtp_db::group::ConversationType::Dm)
+        );
+        assert!(parse_conv_type(99).is_none());
+    }
+
+    #[test]
+    fn stream_join_null_is_error() {
+        let rc = unsafe { xmtp_stream_join(std::ptr::null_mut()) };
+        assert_eq!(rc, -1);
+        assert!(xmtp_last_error_length() > 0);
+    }
+
+    #[test]
+    fn stream_join_already_taken_ok() {
+        let ptr = into_raw(FfiStreamHandle {
+            abort: Arc::new(Box::new(DummyAbort { finished: true })),
+            join: Mutex::new(None),
+        });
+        let rc = unsafe { xmtp_stream_join(ptr) };
+        assert_eq!(rc, 0);
+        unsafe { xmtp_stream_free(ptr) };
+    }
+
+    #[test]
+    fn stream_join_waits_for_callback() {
+        let done = Arc::new(AtomicBool::new(false));
+        let ptr = wrap(Box::new(SleepHandle {
+            delay: Duration::from_millis(50),
+            done: done.clone(),
+        }));
+        unsafe { xmtp_stream_end(ptr) };
+        let rc = unsafe { xmtp_stream_join(ptr) };
+        assert_eq!(rc, 0);
+        assert!(done.load(Ordering::SeqCst));
+        unsafe { xmtp_stream_free(ptr) };
+    }
+
+    #[test]
+    fn stream_join_timeout_leaks_and_callback_still_runs() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let ptr = wrap(Box::new(FlagThenHang { flag: flag.clone() }));
+        let rc = unsafe { xmtp_stream_join(ptr) };
+        assert_eq!(rc, -1);
+        assert!(xmtp_last_error_length() > 0);
+        let start = Instant::now();
+        while !flag.load(Ordering::SeqCst) && start.elapsed() < Duration::from_secs(1) {
+            std::thread::yield_now();
+        }
+        assert!(flag.load(Ordering::SeqCst));
+        unsafe { xmtp_stream_free(ptr) };
+    }
+
+    #[test]
+    fn stream_free_does_not_wait() {
+        let ptr = wrap(Box::new(HangHandle));
+        let start = Instant::now();
+        unsafe { xmtp_stream_free(ptr) };
+        assert!(start.elapsed() < Duration::from_millis(100));
     }
 }

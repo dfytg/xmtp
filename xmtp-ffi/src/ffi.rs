@@ -3,6 +3,7 @@
 use std::cell::RefCell;
 use std::ffi::{CStr, CString, c_char};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 use tokio::runtime::Runtime;
 
@@ -52,8 +53,7 @@ pub(crate) type FfiJoinHandle = Box<
 /// Opaque stream handle.
 pub struct FfiStreamHandle {
     pub(crate) abort: std::sync::Arc<Box<dyn xmtp_common::AbortHandle>>,
-    /// Joinable task; `xmtp_stream_free` drops it without waiting.
-    #[allow(dead_code, reason = "stored for join; free does not wait")]
+    /// Joinable task. `xmtp_stream_join` takes this; `xmtp_stream_free` leaks it if still present.
     pub(crate) join: std::sync::Mutex<Option<FfiJoinHandle>>,
 }
 
@@ -797,12 +797,46 @@ where
 // Shared tokio runtime
 // ---------------------------------------------------------------------------
 
-static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+static RUNTIME: AtomicPtr<Runtime> = AtomicPtr::new(std::ptr::null_mut());
 
 /// Get or initialize the global tokio runtime.
 pub(crate) fn runtime() -> &'static Runtime {
     xmtp_cryptography::install_crypto_provider();
-    RUNTIME.get_or_init(|| Runtime::new().expect("failed to create tokio runtime"))
+    let existing = RUNTIME.load(Ordering::Acquire);
+    // SAFETY: `existing` is null or a `Box::into_raw` pointer from this function.
+    if let Some(rt) = unsafe { existing.as_ref() } {
+        return rt;
+    }
+    let raw = Box::into_raw(Box::new(
+        Runtime::new().expect("failed to create tokio runtime"),
+    ));
+    match RUNTIME.compare_exchange(
+        std::ptr::null_mut(),
+        raw,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => {
+            // SAFETY: `raw` won the race and is a valid `Runtime`.
+            unsafe { &*raw }
+        }
+        Err(winner) => {
+            // SAFETY: this thread's `raw` was not stored; unique ownership.
+            drop(unsafe { Box::from_raw(raw) });
+            // SAFETY: `winner` is the stored `Box::into_raw` pointer.
+            unsafe { &*winner }
+        }
+    }
+}
+
+/// Drop the process-global tokio runtime (cdylib unload). Further FFI calls recreate it.
+#[unsafe(no_mangle)]
+pub extern "C" fn xmtp_shutdown() {
+    let p = RUNTIME.swap(std::ptr::null_mut(), Ordering::AcqRel);
+    if !p.is_null() {
+        // SAFETY: `p` was stored by `runtime` via `Box::into_raw`, or is unique after swap.
+        drop(unsafe { Box::from_raw(p) });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -930,6 +964,14 @@ pub(crate) unsafe fn ref_from<'a, T>(ptr: *const T) -> Result<&'a T, Box<dyn std
         return Err("null handle".into());
     }
     Ok(unsafe { &*ptr })
+}
+
+/// Validate a pointer and create a mutable reference.
+pub(crate) unsafe fn mut_from<'a, T>(ptr: *mut T) -> Result<&'a mut T, Box<dyn std::error::Error>> {
+    if ptr.is_null() {
+        return Err("null handle".into());
+    }
+    Ok(unsafe { &mut *ptr })
 }
 
 /// Box a value and return a raw pointer.
