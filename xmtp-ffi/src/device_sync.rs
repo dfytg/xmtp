@@ -216,7 +216,7 @@ pub unsafe extern "C" fn xmtp_available_archive_list_free(list: *mut FfiAvailabl
 // ---------------------------------------------------------------------------
 
 /// Export an archive to a local file.
-/// `key` must be at least 32 bytes (encryption key).
+/// `key` must be exactly 32 bytes (encryption key).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xmtp_device_sync_create_archive(
     client: *const FfiClient,
@@ -241,7 +241,7 @@ pub unsafe extern "C" fn xmtp_device_sync_create_archive(
 // ---------------------------------------------------------------------------
 
 /// Import a previously exported archive from a file.
-/// `key` must be at least 32 bytes (encryption key).
+/// `key` must be exactly 32 bytes (encryption key).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xmtp_device_sync_import_archive(
     client: *const FfiClient,

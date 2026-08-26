@@ -262,6 +262,21 @@ pub struct FfiGroupMemberList {
     pub(crate) items: Vec<FfiGroupMember>,
 }
 
+impl Drop for FfiGroupMember {
+    fn drop(&mut self) {
+        if !self.inbox_id.is_null() {
+            drop(unsafe { CString::from_raw(self.inbox_id) });
+            self.inbox_id = std::ptr::null_mut();
+        }
+        free_c_string_array(self.account_identifiers, self.account_identifiers_count);
+        self.account_identifiers = std::ptr::null_mut();
+        self.account_identifiers_count = 0;
+        free_c_string_array(self.installation_ids, self.installation_ids_count);
+        self.installation_ids = std::ptr::null_mut();
+        self.installation_ids_count = 0;
+    }
+}
+
 /// A single inbox state entry (batch query result).
 #[repr(C)]
 pub struct FfiInboxStateItem {
@@ -374,6 +389,38 @@ pub struct FfiHmacKeyEntry {
 /// A map of conversation ID → HMAC keys.
 pub struct FfiHmacKeyMap {
     pub(crate) entries: Vec<FfiHmacKeyEntry>,
+}
+
+impl Drop for FfiHmacKey {
+    fn drop(&mut self) {
+        if !self.key.is_null() && self.key_len > 0 {
+            drop(unsafe {
+                Vec::from_raw_parts(self.key, self.key_len as usize, self.key_len as usize)
+            });
+            self.key = std::ptr::null_mut();
+            self.key_len = 0;
+        }
+    }
+}
+
+impl Drop for FfiHmacKeyEntry {
+    fn drop(&mut self) {
+        if !self.group_id.is_null() {
+            drop(unsafe { CString::from_raw(self.group_id) });
+            self.group_id = std::ptr::null_mut();
+        }
+        if !self.keys.is_null() && self.keys_count > 0 {
+            drop(unsafe {
+                Vec::from_raw_parts(
+                    self.keys,
+                    self.keys_count as usize,
+                    self.keys_count as usize,
+                )
+            });
+            self.keys = std::ptr::null_mut();
+            self.keys_count = 0;
+        }
+    }
 }
 
 /// Options for device sync archive operations.
@@ -507,6 +554,35 @@ pub struct FfiEnrichedMessage {
 /// A list of enriched messages.
 pub struct FfiEnrichedMessageList {
     pub(crate) items: Vec<FfiEnrichedMessage>,
+}
+
+impl Drop for FfiEnrichedMessage {
+    fn drop(&mut self) {
+        for p in [
+            &mut self.id,
+            &mut self.group_id,
+            &mut self.sender_inbox_id,
+            &mut self.sender_installation_id,
+            &mut self.content_type,
+            &mut self.fallback_text,
+        ] {
+            if !p.is_null() {
+                drop(unsafe { CString::from_raw(*p) });
+                *p = std::ptr::null_mut();
+            }
+        }
+        if !self.content_bytes.is_null() && self.content_bytes_len > 0 {
+            drop(unsafe {
+                Vec::from_raw_parts(
+                    self.content_bytes,
+                    self.content_bytes_len as usize,
+                    self.content_bytes_len as usize,
+                )
+            });
+            self.content_bytes = std::ptr::null_mut();
+            self.content_bytes_len = 0;
+        }
+    }
 }
 
 /// Last-read-time entry (inbox_id → timestamp_ns).
@@ -704,11 +780,14 @@ pub(crate) fn checked_key32<'a>(
     slice.try_into().map_err(|_| "key must be 32 bytes".into())
 }
 
+/// Convert to an owned `CString`. Fails on interior NUL without leaking.
+pub(crate) fn to_cstring(s: &str) -> Result<CString, Box<dyn std::error::Error>> {
+    CString::new(s).map_err(|_| "string contains interior NUL".into())
+}
+
 /// Allocate a new C string from a Rust `&str`. Caller must free with [`xmtp_free_string`].
 pub(crate) fn to_c_string(s: &str) -> Result<*mut c_char, Box<dyn std::error::Error>> {
-    CString::new(s)
-        .map(CString::into_raw)
-        .map_err(|_| "string contains interior NUL".into())
+    Ok(to_cstring(s)?.into_raw())
 }
 
 /// Pointer-returning FFI: record last error on interior NUL instead of swallowing it.
@@ -787,11 +866,15 @@ pub(crate) unsafe fn parse_identifier(
 }
 
 /// Collect parallel arrays of identifiers and kinds into `Vec<Identifier>`.
+/// `count == 0` is an empty list (pointer may be null). Null with `count > 0` is an error.
 pub(crate) unsafe fn collect_identifiers(
     ptrs: *const *const c_char,
     kinds: *const i32,
     count: i32,
 ) -> Result<Vec<xmtp_id::associations::Identifier>, Box<dyn std::error::Error>> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
     let ptrs = checked_slice_nonempty(ptrs, count)?;
     let kinds = checked_slice_nonempty(kinds, count)?;
     ptrs.iter()
@@ -801,10 +884,14 @@ pub(crate) unsafe fn collect_identifiers(
 }
 
 /// Collect an array of C strings into `Vec<String>`.
+/// `count == 0` is an empty list (pointer may be null). Null with `count > 0` is an error.
 pub(crate) unsafe fn collect_strings(
     ptrs: *const *const c_char,
     count: i32,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
     let ptrs = checked_slice_nonempty(ptrs, count)?;
     ptrs.iter()
         .map(|&p| unsafe { c_str_to_string(p) })
@@ -820,18 +907,18 @@ pub(crate) fn string_vec_to_c(
     if out_count.is_null() {
         return Err("null output pointer".into());
     }
-    let count = v.len();
-    let ptrs: Vec<*mut c_char> = v
-        .into_iter()
-        .map(|s| to_c_string(&s))
-        .collect::<Result<_, _>>()?;
-    // Use into_boxed_slice to guarantee cap == len, avoiding UB in from_raw_parts
-    let boxed = ptrs.into_boxed_slice();
-    let ptr = Box::into_raw(boxed) as *mut *mut c_char;
+    let owned: Vec<CString> = v.iter().map(|s| to_cstring(s)).collect::<Result<_, _>>()?;
+    let count = owned.len();
     unsafe {
         *out_count = count as i32;
     }
-    Ok(ptr)
+    if owned.is_empty() {
+        return Ok(std::ptr::null_mut());
+    }
+    let ptrs: Vec<*mut c_char> = owned.into_iter().map(CString::into_raw).collect();
+    // Use into_boxed_slice to guarantee cap == len, avoiding UB in from_raw_parts
+    let boxed = ptrs.into_boxed_slice();
+    Ok(Box::into_raw(boxed) as *mut *mut c_char)
 }
 
 // ---------------------------------------------------------------------------
@@ -1253,5 +1340,15 @@ mod tests {
         assert!(to_c_string("bad\0nul").is_err());
         assert!(to_c_string_or_null("bad\0nul").is_null());
         assert!(xmtp_last_error_length() > 0);
+    }
+
+    #[test]
+    fn collect_strings_count_zero_is_empty_ok() {
+        let got = unsafe { collect_strings(std::ptr::null(), 0) }.unwrap();
+        assert!(got.is_empty());
+        let p = std::ptr::NonNull::<*const c_char>::dangling().as_ptr();
+        let got = unsafe { collect_strings(p, 0) }.unwrap();
+        assert!(got.is_empty());
+        assert!(unsafe { collect_strings(std::ptr::null(), 2) }.is_err());
     }
 }

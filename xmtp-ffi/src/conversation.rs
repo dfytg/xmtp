@@ -350,10 +350,13 @@ pub unsafe extern "C" fn xmtp_conversation_count_messages(
             Ok(args) => c.inner.count_messages(&args).unwrap_or(0),
             Err(e) => {
                 set_last_error(e.to_string());
-                0
+                -1
             }
         },
-        Err(_) => 0,
+        Err(e) => {
+            set_last_error(e.to_string());
+            -1
+        }
     }
 }
 
@@ -540,29 +543,44 @@ pub unsafe extern "C" fn xmtp_conversation_list_members(
             .into_iter()
             .map(|m| {
                 use xmtp_mls::groups::members::PermissionLevel;
-                // Build account identifiers array
-                let ident_strs: Vec<String> = m
+                let inbox_id = to_cstring(&m.inbox_id)?;
+                let ident_owned: Vec<CString> = m
                     .account_identifiers
                     .iter()
-                    .map(|i| i.to_string())
-                    .collect();
-                let mut ident_count: i32 = 0;
-                let ident_ptrs = string_vec_to_c(ident_strs, &mut ident_count)?;
-                // Build installation IDs array (hex-encoded)
-                let inst_strs: Vec<String> = m.installation_ids.iter().map(hex::encode).collect();
-                let mut inst_count: i32 = 0;
-                let inst_ptrs = string_vec_to_c(inst_strs, &mut inst_count)?;
+                    .map(|i| to_cstring(&i.to_string()))
+                    .collect::<Result<_, _>>()?;
+                let inst_owned: Vec<CString> = m
+                    .installation_ids
+                    .iter()
+                    .map(|id| to_cstring(&hex::encode(id)))
+                    .collect::<Result<_, _>>()?;
+                let ident_count = ident_owned.len() as i32;
+                let inst_count = inst_owned.len() as i32;
+                let ident_ptr = if ident_owned.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    let ident_ptrs: Vec<*mut c_char> =
+                        ident_owned.into_iter().map(CString::into_raw).collect();
+                    Box::into_raw(ident_ptrs.into_boxed_slice()) as *mut *mut c_char
+                };
+                let inst_ptr = if inst_owned.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    let inst_ptrs: Vec<*mut c_char> =
+                        inst_owned.into_iter().map(CString::into_raw).collect();
+                    Box::into_raw(inst_ptrs.into_boxed_slice()) as *mut *mut c_char
+                };
                 Ok(FfiGroupMember {
-                    inbox_id: to_c_string(&m.inbox_id)?,
+                    inbox_id: inbox_id.into_raw(),
                     permission_level: match m.permission_level {
                         PermissionLevel::Member => FfiPermissionLevel::Member,
                         PermissionLevel::Admin => FfiPermissionLevel::Admin,
                         PermissionLevel::SuperAdmin => FfiPermissionLevel::SuperAdmin,
                     },
                     consent_state: consent_state_to_ffi(m.consent_state),
-                    account_identifiers: ident_ptrs,
+                    account_identifiers: ident_ptr,
                     account_identifiers_count: ident_count,
-                    installation_ids: inst_ptrs,
+                    installation_ids: inst_ptr,
                     installation_ids_count: inst_count,
                 })
             })
@@ -688,14 +706,8 @@ pub unsafe extern "C" fn xmtp_group_member_installation_ids(
 /// Free a group member list.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xmtp_group_member_list_free(list: *mut FfiGroupMemberList) {
-    if list.is_null() {
-        return;
-    }
-    let l = unsafe { Box::from_raw(list) };
-    for m in &l.items {
-        free_c_strings!(m, inbox_id);
-        free_c_string_array(m.account_identifiers, m.account_identifiers_count);
-        free_c_string_array(m.installation_ids, m.installation_ids_count);
+    if !list.is_null() {
+        drop(unsafe { Box::from_raw(list) });
     }
 }
 
@@ -1136,7 +1148,9 @@ pub unsafe extern "C" fn xmtp_conversation_debug_info(
             return Err("null output pointer".into());
         }
         let info = c.inner.debug_info().await?;
-        // Build cursor array on the heap
+        let fork_details = to_cstring(&info.fork_details)?;
+        let local_commit_log = to_cstring(&info.local_commit_log)?;
+        let remote_commit_log = to_cstring(&info.remote_commit_log)?;
         let cursors: Vec<FfiCursor> = info
             .cursor
             .iter()
@@ -1146,22 +1160,20 @@ pub unsafe extern "C" fn xmtp_conversation_debug_info(
             })
             .collect();
         let cursors_count = cursors.len() as i32;
-        // Use into_boxed_slice to guarantee cap == len for safe deallocation
-        let cursors_boxed = cursors.into_boxed_slice();
-        let cursors_ptr = Box::into_raw(cursors_boxed) as *mut FfiCursor;
+        let cursors_ptr = Box::into_raw(cursors.into_boxed_slice()) as *mut FfiCursor;
 
         unsafe {
             *out = FfiConversationDebugInfo {
                 epoch: info.epoch,
                 maybe_forked: i32::from(info.maybe_forked),
-                fork_details: to_c_string(&info.fork_details)?,
+                fork_details: fork_details.into_raw(),
                 is_commit_log_forked: match info.is_commit_log_forked {
                     Some(true) => 1,
                     Some(false) => 0,
                     None => -1,
                 },
-                local_commit_log: to_c_string(&info.local_commit_log)?,
-                remote_commit_log: to_c_string(&info.remote_commit_log)?,
+                local_commit_log: local_commit_log.into_raw(),
+                remote_commit_log: remote_commit_log.into_raw(),
                 cursors: cursors_ptr,
                 cursors_count,
             };
@@ -1233,13 +1245,12 @@ pub(crate) fn hmac_keys_to_entry(
     group_id: &[u8],
     keys: Vec<xmtp_db::user_preferences::HmacKey>,
 ) -> Result<FfiHmacKeyEntry, Box<dyn std::error::Error>> {
+    let group_id = to_cstring(&hex::encode(group_id))?;
     let c_keys: Vec<FfiHmacKey> = keys
         .into_iter()
         .map(|k| {
-            let key_vec = k.key.to_vec();
-            let len = key_vec.len() as i32;
-            // Use into_boxed_slice to guarantee cap == len for safe deallocation
-            let boxed = key_vec.into_boxed_slice();
+            let boxed = k.key.to_vec().into_boxed_slice();
+            let len = boxed.len() as i32;
             let ptr = Box::into_raw(boxed) as *mut u8;
             FfiHmacKey {
                 key: ptr,
@@ -1249,10 +1260,13 @@ pub(crate) fn hmac_keys_to_entry(
         })
         .collect();
     let keys_count = c_keys.len() as i32;
-    let keys_boxed = c_keys.into_boxed_slice();
-    let keys_ptr = Box::into_raw(keys_boxed) as *mut FfiHmacKey;
+    let keys_ptr = if c_keys.is_empty() {
+        std::ptr::null_mut()
+    } else {
+        Box::into_raw(c_keys.into_boxed_slice()) as *mut FfiHmacKey
+    };
     Ok(FfiHmacKeyEntry {
-        group_id: to_c_string(&hex::encode(group_id))?,
+        group_id: group_id.into_raw(),
         keys: keys_ptr,
         keys_count,
     })
@@ -1509,6 +1523,15 @@ pub(crate) fn decoded_to_enriched(
         "{}/{}:{}.{}",
         ct.authority_id, ct.type_id, ct.version_major, ct.version_minor
     );
+    let id = to_cstring(&hex::encode(&msg.metadata.id))?;
+    let group_id = to_cstring(&hex::encode(&msg.metadata.group_id))?;
+    let sender_inbox_id = to_cstring(&msg.metadata.sender_inbox_id)?;
+    let sender_installation_id = to_cstring(&hex::encode(&msg.metadata.sender_installation_id))?;
+    let content_type = to_cstring(&ct_str)?;
+    let fallback_text = match &msg.fallback_text {
+        Some(t) => Some(to_cstring(t)?),
+        None => None,
+    };
     let (content_bytes, content_bytes_len) = if raw_content.is_empty() {
         (std::ptr::null_mut(), 0)
     } else {
@@ -1517,10 +1540,10 @@ pub(crate) fn decoded_to_enriched(
         (Box::into_raw(b) as *mut u8, len)
     };
     Ok(FfiEnrichedMessage {
-        id: to_c_string(&hex::encode(&msg.metadata.id))?,
-        group_id: to_c_string(&hex::encode(&msg.metadata.group_id))?,
-        sender_inbox_id: to_c_string(&msg.metadata.sender_inbox_id)?,
-        sender_installation_id: to_c_string(&hex::encode(&msg.metadata.sender_installation_id))?,
+        id: id.into_raw(),
+        group_id: group_id.into_raw(),
+        sender_inbox_id: sender_inbox_id.into_raw(),
+        sender_installation_id: sender_installation_id.into_raw(),
         sent_at_ns: msg.metadata.sent_at_ns,
         inserted_at_ns: msg.metadata.inserted_at_ns,
         kind: match msg.metadata.kind {
@@ -1534,11 +1557,10 @@ pub(crate) fn decoded_to_enriched(
             xmtp_db::group_message::DeliveryStatus::Published => FfiDeliveryStatus::Published,
             xmtp_db::group_message::DeliveryStatus::Failed => FfiDeliveryStatus::Failed,
         },
-        content_type: to_c_string(&ct_str)?,
-        fallback_text: match &msg.fallback_text {
-            Some(t) => to_c_string(t)?,
-            None => std::ptr::null_mut(),
-        },
+        content_type: content_type.into_raw(),
+        fallback_text: fallback_text
+            .map(CString::into_raw)
+            .unwrap_or(std::ptr::null_mut()),
         expires_at_ns: msg.metadata.expires_at_ns.unwrap_or(0),
         num_reactions: msg.reactions.len() as i32,
         num_replies: msg.num_replies as i32,
@@ -1595,29 +1617,8 @@ ffi_list_get!(
 /// Free an enriched message list (including owned strings and content bytes).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xmtp_enriched_message_list_free(list: *mut FfiEnrichedMessageList) {
-    if list.is_null() {
-        return;
-    }
-    let l = unsafe { Box::from_raw(list) };
-    for item in &l.items {
-        free_c_strings!(
-            item,
-            id,
-            group_id,
-            sender_inbox_id,
-            sender_installation_id,
-            content_type,
-            fallback_text
-        );
-        if !item.content_bytes.is_null() && item.content_bytes_len > 0 {
-            drop(unsafe {
-                Vec::from_raw_parts(
-                    item.content_bytes,
-                    item.content_bytes_len as usize,
-                    item.content_bytes_len as usize,
-                )
-            });
-        }
+    if !list.is_null() {
+        drop(unsafe { Box::from_raw(list) });
     }
 }
 
@@ -1664,29 +1665,7 @@ ffi_list_free!(
 /// Free an HMAC key map (including all owned data).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xmtp_hmac_key_map_free(map: *mut FfiHmacKeyMap) {
-    if map.is_null() {
-        return;
-    }
-    let m = unsafe { Box::from_raw(map) };
-    for entry in &m.entries {
-        if !entry.group_id.is_null() {
-            drop(unsafe { CString::from_raw(entry.group_id) });
-        }
-        if !entry.keys.is_null() && entry.keys_count > 0 {
-            let keys = unsafe {
-                Vec::from_raw_parts(
-                    entry.keys,
-                    entry.keys_count as usize,
-                    entry.keys_count as usize,
-                )
-            };
-            for k in &keys {
-                if !k.key.is_null() && k.key_len > 0 {
-                    drop(unsafe {
-                        Vec::from_raw_parts(k.key, k.key_len as usize, k.key_len as usize)
-                    });
-                }
-            }
-        }
+    if !map.is_null() {
+        drop(unsafe { Box::from_raw(map) });
     }
 }

@@ -460,6 +460,10 @@ impl ClientBuilder {
     }
 
     /// Set a 32-byte encryption key for the local database.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::XmtpError::InvalidArgument`] if `k` is not exactly 32 bytes.
     pub fn encryption_key(mut self, k: impl Into<Vec<u8>>) -> Result<Self> {
         let k = k.into();
         if k.len() != 32 {

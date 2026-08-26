@@ -1,6 +1,6 @@
 //! Client lifecycle, properties, and consent operations.
 
-use std::ffi::c_char;
+use std::ffi::{CString, c_char};
 use std::sync::Arc;
 
 use crate::ffi::*;
@@ -404,16 +404,34 @@ fn association_state_to_item(
         .map(|(_, ts)| ts.map_or(0, |v| v as i64))
         .collect();
 
-    let mut ident_count: i32 = 0;
-    let ident_ptrs = string_vec_to_c(identifiers, &mut ident_count)?;
-    let mut inst_count: i32 = 0;
-    let inst_ptrs = string_vec_to_c(installations, &mut inst_count)?;
-    // Use into_boxed_slice to guarantee cap == len for safe deallocation
-    let ts_boxed = timestamps.into_boxed_slice();
-    let ts_ptr = Box::into_raw(ts_boxed) as *mut i64;
+    let inbox_cs = to_cstring(&inbox_id)?;
+    let recovery_cs = to_cstring(&recovery)?;
+    let ident_cs: Vec<CString> = identifiers
+        .iter()
+        .map(|s| to_cstring(s))
+        .collect::<Result<_, _>>()?;
+    let inst_cs: Vec<CString> = installations
+        .iter()
+        .map(|s| to_cstring(s))
+        .collect::<Result<_, _>>()?;
+    let ident_count = ident_cs.len() as i32;
+    let inst_count = inst_cs.len() as i32;
+    let ident_ptrs = if ident_cs.is_empty() {
+        std::ptr::null_mut()
+    } else {
+        let ptrs: Vec<*mut c_char> = ident_cs.into_iter().map(CString::into_raw).collect();
+        Box::into_raw(ptrs.into_boxed_slice()) as *mut *mut c_char
+    };
+    let inst_ptrs = if inst_cs.is_empty() {
+        std::ptr::null_mut()
+    } else {
+        let ptrs: Vec<*mut c_char> = inst_cs.into_iter().map(CString::into_raw).collect();
+        Box::into_raw(ptrs.into_boxed_slice()) as *mut *mut c_char
+    };
+    let ts_ptr = Box::into_raw(timestamps.into_boxed_slice()) as *mut i64;
     Ok(FfiInboxStateItem {
-        inbox_id: to_c_string(&inbox_id)?,
-        recovery_identifier: to_c_string(&recovery)?,
+        inbox_id: inbox_cs.into_raw(),
+        recovery_identifier: recovery_cs.into_raw(),
         identifiers: ident_ptrs,
         identifiers_count: ident_count,
         installation_ids: inst_ptrs,
@@ -676,11 +694,7 @@ pub unsafe extern "C" fn xmtp_client_fetch_inbox_states(
         if out.is_null() {
             return Err("null output pointer".into());
         }
-        let ids = if inbox_ids.is_null() || count == 0 {
-            Vec::new()
-        } else {
-            unsafe { collect_strings(inbox_ids, count)? }
-        };
+        let ids = unsafe { collect_strings(inbox_ids, count)? };
         let states = c
             .inner
             .inbox_addresses(
