@@ -38,6 +38,8 @@ At build time, the build script:
 | `x86_64-pc-windows-msvc` | ✅ |
 | `aarch64-pc-windows-msvc` | ✅ |
 
+Intel macOS (`x86_64-apple-darwin`) is unsupported.
+
 ## License
 
-Licensed under the MIT license.
+Licensed under either of [Apache License, Version 2.0](../LICENSE-APACHE) or [MIT License](../LICENSE-MIT) at your option.

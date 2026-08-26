@@ -7,7 +7,7 @@ This crate compiles to a **static library** (`libxmtp_ffi.a` / `xmtp_ffi.lib`) w
 ## Architecture
 
 ```text
-libxmtp (upstream crates, pinned git rev)
+libxmtp (upstream crates, pinned release tag)
     ↓
 xmtp-ffi/src/*.rs          Rust → C wrapper
     ↓ cbindgen (build.rs)
@@ -26,7 +26,7 @@ libxmtp_ffi.a               Static library
 
 ## Build
 
-Requires **nightly** Rust (for `cbindgen` macro expansion). The toolchain is pinned in `rust-toolchain.toml`.
+Requires **rustc 1.97.1** (pinned in `rust-toolchain.toml`). cbindgen runs only when `XMTP_GEN_HEADER=1` and needs nightly (`make header`).
 
 ```sh
 cargo build --release

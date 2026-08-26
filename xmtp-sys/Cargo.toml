@@ -10,7 +10,7 @@ links = "xmtp_ffi"
 documentation = "https://docs.rs/xmtp-sys"
 categories = ["api-bindings", "cryptography", "network-programming"]
 keywords = ["xmtp", "ffi", "messaging", "e2e-encryption", "mls"]
-rust-version = "1.85"
+rust-version = "1.94"
 
 [features]
 ## Re-generate bindings from the C header at build time (requires libclang).

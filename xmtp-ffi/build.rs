@@ -2,6 +2,17 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=XMTP_GEN_HEADER");
+
+    // Committed include/xmtp_ffi.h is the source of truth. cbindgen needs
+    // nightly (`-Zunpretty=expanded`); skip unless explicitly requested.
+    if env::var("XMTP_GEN_HEADER").as_deref() != Ok("1") {
+        return;
+    }
+
+    println!("cargo:rerun-if-changed=cbindgen.toml");
+    println!("cargo:rerun-if-changed=src");
+
     let crate_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
     let output_dir = PathBuf::from(&crate_dir).join("include");
     std::fs::create_dir_all(&output_dir).expect("Failed to create include directory");

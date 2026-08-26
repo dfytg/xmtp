@@ -9,7 +9,7 @@ readme = "README.md"
 documentation = "https://docs.rs/xmtp"
 categories = ["api-bindings", "cryptography", "network-programming"]
 keywords = ["xmtp", "messaging", "e2e-encryption", "mls", "web3"]
-rust-version = "1.85"
+rust-version = "1.94"
 
 [features]
 default = ["content"]
