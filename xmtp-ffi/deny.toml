@@ -1,5 +1,4 @@
-# FFI graph (standalone workspace). License and git allow-lists are from a
-# real `cargo deny --manifest-path xmtp-ffi/Cargo.toml check` run.
+# Standalone FFI graph; root deny.toml does not load these git deps.
 
 [graph]
 all-features = true

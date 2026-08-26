@@ -214,6 +214,9 @@ together in the same commit before tagging.**
    - Builds static libs for 5 targets → publishes GitHub Release `ffi-v0.1.N`
    - Publishes `xmtp-sys v0.1.N` to crates.io
 
+   Do not tag `ffi-v*` until `ffi-build.yml` installs 1.97.1 targets
+   (the crate pin is 1.97.1; the workflow still installs nightly targets only).
+
 **Phase B — SDK + CLI release** (always, or when only SDK/CLI changes):
 
 1. Bump workspace version in root `Cargo.toml` → affects `xmtp` and `xmtp-cli`
