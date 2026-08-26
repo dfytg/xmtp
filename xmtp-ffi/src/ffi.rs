@@ -785,6 +785,8 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<(), Box<dyn std::error::Error>>>,
 {
+    // Apple staticlib does not run rustls' ctor; first HTTPS otherwise panics.
+    xmtp_cryptography::install_crypto_provider();
     catch(|| match tokio::runtime::Handle::try_current() {
         Ok(handle) => tokio::task::block_in_place(|| handle.block_on(f())),
         Err(_) => runtime().block_on(f()),
@@ -799,6 +801,7 @@ static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
 /// Get or initialize the global tokio runtime.
 pub(crate) fn runtime() -> &'static Runtime {
+    xmtp_cryptography::install_crypto_provider();
     RUNTIME.get_or_init(|| Runtime::new().expect("failed to create tokio runtime"))
 }
 

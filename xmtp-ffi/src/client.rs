@@ -77,7 +77,8 @@ pub unsafe extern "C" fn xmtp_client_create(
         backend.v3_host(&host);
 
         // Optional gateway host (enables d14n)
-        let gateway_host = unsafe { c_str_to_option(opts.gateway_host)? };
+        let gateway_host = unsafe { c_str_to_option(opts.gateway_host)? }
+            .map(|h| host_with_scheme(h, opts.is_secure != 0));
         backend.maybe_gateway_host(gateway_host);
 
         // Optional app version
