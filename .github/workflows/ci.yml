@@ -19,7 +19,6 @@ env:
   NIGHTLY: nightly-2026-08-03
 
 jobs:
-  # ci-rust.yml fmt --check uses the compile toolchain; group_imports needs nightly.
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 30

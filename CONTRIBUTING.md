@@ -178,8 +178,9 @@ make pre-commit     # fmt + clippy + test + build + changelog
 
 | Workflow | Trigger | Purpose |
 | --- | --- | --- |
-| `ci.yml` | Push/PR to `main` | CI checks (reusable workflow) |
-| `ffi-build.yml` | `ffi-v*.*.*` tag | Build FFI static libraries for 5 targets → GitHub Release, then publish `xmtp-sys` to crates.io |
+| `ci.yml` | Push/PR to `main` | 1.97.1 workspace build/test; nightly fmt/clippy; MSRV 1.94; dual `cargo deny`; bindings dirty |
+| `ffi-check.yml` | Push/PR to `main` on `xmtp-ffi/**` | 1.97.1 `xmtp-ffi` check; dual `cargo deny`; header dirty (`make header` on nightly) |
+| `ffi-build.yml` | `ffi-v*.*.*` tag | Build FFI static libraries for 5 targets on rustc 1.97.1 → GitHub Release, then publish `xmtp-sys` to crates.io |
 | `release.yml` | `v*.*.*` tag | Build CLI binaries, create GitHub Release |
 | `publish.yml` | `v*.*.*` tag | Publish `xmtp` and `xmtp-cli` to crates.io |
 
@@ -212,11 +213,10 @@ together in the same commit before tagging.**
    - **Changed** → run `make regenerate-bindings` and commit the refreshed
      `xmtp-sys/src/bindings.rs`
 4. `git tag ffi-v0.1.N && git push --tags` — triggers `ffi-build.yml`:
-   - Builds static libs for 5 targets → publishes GitHub Release `ffi-v0.1.N`
+   - Compiles static libs for 5 targets with rustc 1.97.1 (cbindgen skipped) → GitHub Release `ffi-v0.1.N`
    - Publishes `xmtp-sys v0.1.N` to crates.io
 
-   Do not tag `ffi-v*` until `ffi-build.yml` installs 1.97.1 targets
-   (the crate pin is 1.97.1; the workflow still installs nightly targets only).
+   cbindgen stays on `make header` and the `ffi-check.yml` header job (`nightly-2026-08-03`).
 
 **Phase B — SDK + CLI release** (always, or when only SDK/CLI changes):
 
