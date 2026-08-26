@@ -142,6 +142,7 @@ make ffi-build      # build xmtp-ffi static library (1.97.1; cbindgen skipped)
 make ffi-check      # check xmtp-ffi compilation (1.97.1; cbindgen skipped)
 make regenerate-bindings  # regenerate xmtp-sys/src/bindings.rs
 make tag-ffi        # verify xmtp-ffi/xmtp-sys versions; print git tag ffi-v* (CONFIRM=1 to tag)
+make tag-sdk        # verify workspace version; print git tag v* (CONFIRM=1 to tag)
 make pre-commit     # fmt + clippy + test + build + changelog
 ```
 
@@ -225,12 +226,23 @@ together in the same commit before tagging.**
 **Phase B — SDK + CLI release** (always, or when only SDK/CLI changes):
 
 1. Bump workspace version in root `Cargo.toml` → affects `xmtp` and `xmtp-cli`
-2. `git tag v0.9.N && git push --tags` — triggers `release.yml` + `publish.yml`:
-   - Builds CLI binaries for all platforms → GitHub Release `v0.9.N`
+2. Required Dev smoke (not automated; do not skip):
+
+   ```sh
+   xmtp new ci-smoke --env dev
+   xmtp dm <peer-address-or-inbox> --profile ci-smoke
+   ```
+
+3. `make tag-sdk` reads workspace `version` and fails unless it matches
+   `VERSION` (default `0.10.0`) and both `xmtp` / `xmtp-cli` inherit it.
+   It prints `git tag v${VERSION}` and `git push --tags`.
+   `make tag-sdk CONFIRM=1` creates the **local** tag only (does not push).
+4. After smoke succeeds: `git push --tags` — triggers `release.yml` + `publish.yml`:
+   - Builds CLI binaries for all platforms → GitHub Release `v0.10.N`
    - Publishes `xmtp` and `xmtp-cli` to crates.io
 
 > Phase A can be skipped when there are no FFI changes. Phase B is the normal
-> release cadence.
+> release cadence. Do not push `v*` until the Dev smoke DM succeeds.
 
 ## Supported Platforms
 

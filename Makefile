@@ -4,7 +4,7 @@
 NIGHTLY ?= nightly-2026-08-03
 
 .PHONY: all build check run test bench clippy clippy-fix fmt doc update \
-	header ffi-build ffi-check regenerate-bindings tag-ffi changelog pre-commit
+	header ffi-build ffi-check regenerate-bindings tag-ffi tag-sdk changelog pre-commit
 
 all: fmt clippy-fix
 
@@ -123,6 +123,52 @@ tag-ffi:
 	else \
 		echo; \
 		echo "print-only; re-run with CONFIRM=1 to create git tag ffi-v$$version"; \
+	fi
+
+# Operator gate: refuse v* unless workspace.package.version matches VERSION.
+# Default VERSION=0.10.0 (target-specific; tag-ffi keeps 0.2.0).
+# Override: make tag-sdk VERSION=x.y.z
+# Print-only unless CONFIRM=1 (creates local tag). Does not push.
+tag-sdk: VERSION = 0.10.0
+tag-sdk:
+	@set -eu; \
+	sdk=$$(sed -n 's/^version = "\(.*\)"/\1/p' $(CURDIR)/Cargo.toml | head -1); \
+	version="$(VERSION)"; \
+	if [ -z "$$sdk" ]; then \
+		echo "failed to read version from Cargo.toml" >&2; \
+		exit 1; \
+	fi; \
+	if ! grep -q '^version.workspace = true' $(CURDIR)/xmtp/Cargo.toml; then \
+		echo "xmtp does not inherit workspace version" >&2; \
+		exit 1; \
+	fi; \
+	if ! grep -q '^version.workspace = true' $(CURDIR)/xmtp-cli/Cargo.toml; then \
+		echo "xmtp-cli does not inherit workspace version" >&2; \
+		exit 1; \
+	fi; \
+	if [ "$$sdk" != "$$version" ]; then \
+		echo "workspace version $$sdk != VERSION=$$version" >&2; \
+		exit 1; \
+	fi; \
+	echo "xmtp=$$sdk xmtp-cli=$$sdk"; \
+	echo; \
+	echo "git tag v$$version"; \
+	echo "git push --tags"; \
+	echo; \
+	echo "Required Dev smoke before push:"; \
+	echo "  xmtp new ci-smoke --env dev"; \
+	echo "  xmtp dm <peer> --profile ci-smoke"; \
+	echo; \
+	echo "After release.yml + publish.yml:"; \
+	echo "  CLI binaries on GitHub Release v$$version"; \
+	echo "  cargo publish of xmtp and xmtp-cli"; \
+	if [ "$(CONFIRM)" = "1" ]; then \
+		git tag "v$$version"; \
+		echo; \
+		echo "created tag v$$version (not pushed)"; \
+	else \
+		echo; \
+		echo "print-only; re-run with CONFIRM=1 to create git tag v$$version"; \
 	fi
 
 changelog:
