@@ -21,6 +21,7 @@ regenerate = ["dep:bindgen"]
 bindgen = { workspace = true, optional = true }
 ureq.workspace = true
 flate2.workspace = true
+sha2.workspace = true
 tar.workspace = true
 zip.workspace = true
 

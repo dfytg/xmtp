@@ -58,6 +58,9 @@
     clippy::upper_case_acronyms
 )]
 
+#[cfg(test)]
+mod integrity;
+
 // When the `regenerate` feature is enabled, use freshly generated bindings.
 // Otherwise, use the pre-generated bindings committed in the repository.
 #[cfg(feature = "regenerate")]
