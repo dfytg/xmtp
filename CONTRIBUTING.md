@@ -150,7 +150,7 @@ make pre-commit     # fmt + clippy + test + build + changelog
 - **Lints**: Strict — `clippy::pedantic` with targeted allowances (see `Cargo.toml` `[workspace.lints]`)
 - **Comments**: English only, professional
 - **Formatting**: `rustfmt` with nightly features (see `rustfmt.toml`)
-- **No `unsafe` outside the allow-list:** `xmtp-sys/src/lib.rs` and `xmtp/src/{lib,ffi,stream,error,conversation}.rs`, `xmtp/src/client/{mod,identity,conversations}.rs`. New `unsafe` only in modules that call `xmtp_sys`.
+- **No `unsafe` outside the allow-list:** `xmtp-sys/src/lib.rs` and `xmtp/src/{lib,ffi,stream,error,conversation,archive}.rs`, `xmtp/src/client/{mod,identity,conversations}.rs`. New `unsafe` only in modules that call `xmtp_sys`.
 
 ### FFI Conventions (xmtp-ffi)
 

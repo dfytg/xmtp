@@ -209,17 +209,18 @@ Each installation tracks a **cursor** (bookmark) per conversation. `sync()` only
 
 A new installation cannot decrypt messages sent before it joined the MLS group. To access historical messages, XMTP provides [History Transfer](https://docs.xmtp.org/chat-apps/list-stream-sync/history-sync) (defined in [XIP-64](https://github.com/xmtp/XIPs/blob/main/XIPs/xip-64-history-transfer.md)):
 
-1. **New device** requests history via the sync group (`initiateHistoryRequest`)
+1. **New device** calls `Client::send_sync_request` (URL from `Env::history_sync_url()` or `ClientBuilder::history_sync_url`)
 2. **Existing device** (must be online) prepares and uploads an encrypted archive to the history server
-3. **New device** downloads and imports the archive into its local database
+3. **New device** downloads and imports the archive (`process_sync_archive` / `import_archive`)
 
 Key details:
 
-- History transfer is **enabled by default** — the SDK sets `historySyncUrl` to an XMTP Labs-hosted server based on your `env` setting
+- `ClientBuilder::build()` does **not** send a history-sync request. Call `send_sync_request` (or `send_sync_request_to`) explicitly.
+- Default server URL is `Env::history_sync_url()` (XMTP Labs hosts per env). Override with `ClientBuilder::history_sync_url` or `send_sync_request_to`.
+- Disable the device-sync worker with `ClientBuilder::disable_device_sync()`. Empty-string URL is not a disable switch.
 - The encrypted payload is stored on the history server for **24 hours** only
 - The archive includes conversations, messages, consent state, and HMAC keys
 - **If all installations are lost**, message history is unrecoverable (no server-side plaintext storage)
-- You can self-host the history server or disable it by setting `historySyncUrl` to an empty string
 
 ## Supported Platforms
 

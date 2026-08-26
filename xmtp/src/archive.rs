@@ -127,8 +127,9 @@ pub fn archive_metadata(path: &str, key: &[u8; 32]) -> Result<ArchiveMetadata> {
     })
 }
 
-fn i32_count(n: i32) -> u32 {
-    u32::try_from(n).unwrap_or(0)
+fn i32_count(n: i32) -> Result<u32> {
+    u32::try_from(n)
+        .map_err(|_| crate::XmtpError::InvalidArgument(format!("negative device-sync count: {n}")))
 }
 
 fn read_available_archives(
@@ -246,8 +247,8 @@ impl Client {
             )
         })?;
         Ok(SyncResult {
-            synced: i32_count(synced),
-            eligible: i32_count(eligible),
+            synced: i32_count(synced)?,
+            eligible: i32_count(eligible)?,
         })
     }
 
@@ -334,5 +335,15 @@ mod tests {
         }
         .to_ffi();
         assert_eq!(empty.elements, 0);
+    }
+
+    #[test]
+    fn i32_count_rejects_negative() {
+        assert_eq!(i32_count(0).unwrap(), 0);
+        assert_eq!(i32_count(7).unwrap(), 7);
+        assert!(matches!(
+            i32_count(-1),
+            Err(crate::XmtpError::InvalidArgument(_))
+        ));
     }
 }
