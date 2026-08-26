@@ -4,7 +4,7 @@
 NIGHTLY ?= nightly-2026-08-03
 
 .PHONY: all build check run test bench clippy clippy-fix fmt doc update \
-	header ffi-build ffi-check regenerate-bindings changelog pre-commit
+	header ffi-build ffi-check regenerate-bindings tag-ffi changelog pre-commit
 
 all: fmt clippy-fix
 
@@ -79,6 +79,51 @@ ffi-check:
 regenerate-bindings:
 	XMTP_FFI_DIR=$(CURDIR)/xmtp-ffi XMTP_UPDATE_BINDINGS=1 \
 		cargo check -p xmtp-sys --features regenerate
+
+# Operator gate: refuse ffi-v* unless xmtp-ffi and xmtp-sys versions match VERSION.
+# Default VERSION=0.2.0. Override: make tag-ffi VERSION=x.y.z
+# Print-only unless CONFIRM=1 (creates local tag). Does not push.
+VERSION ?= 0.2.0
+
+tag-ffi:
+	@set -eu; \
+	ffi=$$(sed -n 's/^version = "\(.*\)"/\1/p' $(CURDIR)/xmtp-ffi/Cargo.toml | head -1); \
+	sys=$$(sed -n 's/^version = "\(.*\)"/\1/p' $(CURDIR)/xmtp-sys/Cargo.toml | head -1); \
+	version="$(VERSION)"; \
+	if [ -z "$$ffi" ] || [ -z "$$sys" ]; then \
+		echo "failed to read versions from xmtp-ffi/Cargo.toml and xmtp-sys/Cargo.toml" >&2; \
+		exit 1; \
+	fi; \
+	if [ "$$ffi" != "$$sys" ]; then \
+		echo "xmtp-ffi $$ffi != xmtp-sys $$sys" >&2; \
+		exit 1; \
+	fi; \
+	if [ "$$ffi" != "$$version" ]; then \
+		echo "crate versions $$ffi != VERSION=$$version" >&2; \
+		exit 1; \
+	fi; \
+	echo "xmtp-ffi=$$ffi xmtp-sys=$$sys"; \
+	echo; \
+	echo "git tag ffi-v$$version"; \
+	echo "git push --tags"; \
+	echo; \
+	echo "After ffi-build.yml:"; \
+	echo "  five GitHub Release assets must exist:"; \
+	echo "    xmtp-ffi-x86_64-unknown-linux-gnu.tar.gz"; \
+	echo "    xmtp-ffi-aarch64-unknown-linux-gnu.tar.gz"; \
+	echo "    xmtp-ffi-aarch64-apple-darwin.tar.gz"; \
+	echo "    xmtp-ffi-x86_64-pc-windows-msvc.zip"; \
+	echo "    xmtp-ffi-aarch64-pc-windows-msvc.zip"; \
+	echo "  hash job (checksums) must be green"; \
+	echo "  then: cargo publish -p xmtp-sys"; \
+	if [ "$(CONFIRM)" = "1" ]; then \
+		git tag "ffi-v$$version"; \
+		echo; \
+		echo "created tag ffi-v$$version (not pushed)"; \
+	else \
+		echo; \
+		echo "print-only; re-run with CONFIRM=1 to create git tag ffi-v$$version"; \
+	fi
 
 changelog:
 	@test -s CHANGELOG.md

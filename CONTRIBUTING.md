@@ -141,6 +141,7 @@ make header         # regenerate xmtp-ffi/include/xmtp_ffi.h (nightly + XMTP_GEN
 make ffi-build      # build xmtp-ffi static library (1.97.1; cbindgen skipped)
 make ffi-check      # check xmtp-ffi compilation (1.97.1; cbindgen skipped)
 make regenerate-bindings  # regenerate xmtp-sys/src/bindings.rs
+make tag-ffi        # verify xmtp-ffi/xmtp-sys versions; print git tag ffi-v* (CONFIRM=1 to tag)
 make pre-commit     # fmt + clippy + test + build + changelog
 ```
 
@@ -205,16 +206,19 @@ together in the same commit before tagging.**
 
 1. Update upstream libxmtp pin in `xmtp-ffi/Cargo.toml` and adapt any breaking APIs
 2. **Bump both versions together** in the same commit:
-   - `xmtp-ffi/Cargo.toml` → `version = "0.1.N"`
-   - `xmtp-sys/Cargo.toml` → `version = "0.1.N"` (must match exactly)
+   - `xmtp-ffi/Cargo.toml` → `version = "0.2.N"`
+   - `xmtp-sys/Cargo.toml` → `version = "0.2.N"` (must match exactly)
 3. Verify `cd xmtp-ffi && cargo build` succeeds (rustc 1.97.1; cbindgen skipped).
    Run `make header` and diff `xmtp-ffi/include/xmtp_ffi.h`:
    - **Unchanged** → no further action needed
    - **Changed** → run `make regenerate-bindings` and commit the refreshed
      `xmtp-sys/src/bindings.rs`
-4. `git tag ffi-v0.1.N && git push --tags` — triggers `ffi-build.yml`:
-   - Compiles static libs for 5 targets with rustc 1.97.1 (cbindgen skipped) → GitHub Release `ffi-v0.1.N`
-   - Publishes `xmtp-sys v0.1.N` to crates.io
+4. `make tag-ffi` reads both crate versions and fails unless they are equal and
+   match `VERSION` (default `0.2.0`). It prints `git tag ffi-v${VERSION}` and
+   `git push --tags`. `make tag-ffi CONFIRM=1` creates the local tag only;
+   then `git push --tags` to trigger `ffi-build.yml`. After the workflow: five
+   GitHub Release assets must exist, the hash (`checksums`) job must be green,
+   then `cargo publish -p xmtp-sys`.
 
    cbindgen stays on `make header` and the `ffi-check.yml` header job (`nightly-2026-08-03`).
 
