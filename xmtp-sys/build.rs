@@ -16,20 +16,33 @@
 //! - `XMTP_UPDATE_BINDINGS` — When set (any value) alongside the `regenerate`
 //!   feature, the freshly generated `bindings.rs` is copied back to
 //!   `src/bindings.rs` so it can be committed to the repository.
+//!
+//! Download builds verify the archive against `sha256sums/{version}` when that
+//! file exists. There is no skip flag; use `XMTP_FFI_DIR` to avoid downloading.
 
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+
+use sha2::{Digest, Sha256};
+
+#[path = "src/integrity.rs"]
+mod integrity;
 
 /// GitHub repository for downloading FFI releases.
 const GITHUB_REPO: &str = "qntx/xmtp";
+
+/// Hex digest of the verified archive, written next to the extracted lib.
+const ARCHIVE_STAMP: &str = "archive.sha256";
 
 fn main() {
     println!("cargo:rerun-if-env-changed=XMTP_FFI_DIR");
     println!("cargo:rerun-if-env-changed=XMTP_FFI_VERSION");
     println!("cargo:rerun-if-env-changed=XMTP_UPDATE_BINDINGS");
     println!("cargo:rerun-if-env-changed=DOCS_RS");
+    println!("cargo:rerun-if-changed=sha256sums");
 
     // docs.rs builds run in a network-isolated sandbox; skip downloading and
     // linking the native library entirely. The crate still compiles for docs.
@@ -61,9 +74,15 @@ fn main() {
 
         let lib_dir = out_dir.join("lib");
         let lib_file = lib_dir.join(lib_filename(&target));
-
-        if !lib_file.exists() {
-            download_and_extract(&version, &target, &lib_dir);
+        let asset = integrity::release_asset_name(&target);
+        let expected = expected_archive_digest(&version, &asset);
+        let stamp = fs::read_to_string(lib_dir.join(ARCHIVE_STAMP)).ok();
+        if !integrity::cached_extract_is_fresh(
+            lib_file.exists(),
+            expected.as_deref(),
+            stamp.as_deref(),
+        ) {
+            download_and_extract(&version, &target, &lib_dir, expected.as_deref());
         }
 
         println!("cargo:rustc-link-search=native={}", lib_dir.display());
@@ -121,13 +140,39 @@ fn link_system_libs(target: &str) {
     }
 }
 
+/// Fail-closed only when `sha256sums/{version}` exists. Missing map → warning, not error.
+fn load_checksum_map(version: &str) -> Option<BTreeMap<String, String>> {
+    let map_path =
+        PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"))
+            .join("sha256sums")
+            .join(version);
+    println!("cargo:rerun-if-changed={}", map_path.display());
+    match fs::read_to_string(&map_path) {
+        Ok(s) => Some(integrity::parse_gnu_sha256sum(&s).unwrap_or_else(|e| {
+            panic!("Invalid GNU sha256sum map {}: {e}", map_path.display());
+        })),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            println!(
+                "cargo:warning=No SHA-256 map for FFI version {version}; skipping checksum verification"
+            );
+            None
+        }
+        Err(e) => panic!("Failed to read SHA-256 map {}: {e}", map_path.display()),
+    }
+}
+
+fn expected_archive_digest(version: &str, asset: &str) -> Option<String> {
+    let map = load_checksum_map(version)?;
+    let Some(hash) = map.get(asset) else {
+        panic!("SHA-256 map for {version} has no hash for asset {asset}");
+    };
+    Some(hash.clone())
+}
+
 /// Download the archive from GitHub Releases and extract it to `dest`.
-fn download_and_extract(version: &str, target: &str, dest: &Path) {
-    let is_windows = target.contains("windows");
-    let ext = if is_windows { "zip" } else { "tar.gz" };
-    let url = format!(
-        "https://github.com/{GITHUB_REPO}/releases/download/ffi-v{version}/xmtp-ffi-{target}.{ext}"
-    );
+fn download_and_extract(version: &str, target: &str, dest: &Path, expected: Option<&str>) {
+    let asset = integrity::release_asset_name(target);
+    let url = format!("https://github.com/{GITHUB_REPO}/releases/download/ffi-v{version}/{asset}");
 
     eprintln!("Downloading {url}");
 
@@ -135,50 +180,111 @@ fn download_and_extract(version: &str, target: &str, dest: &Path) {
         .call()
         .unwrap_or_else(|e| panic!("Failed to download FFI library from {url}: {e}"));
 
-    fs::create_dir_all(dest).expect("Failed to create output directory");
+    let mut bytes = Vec::new();
+    resp.into_body()
+        .into_reader()
+        .read_to_end(&mut bytes)
+        .unwrap_or_else(|e| panic!("Failed to read FFI library from {url}: {e}"));
 
-    let body = resp.into_body().into_reader();
-    if is_windows {
-        extract_zip(body, dest);
-    } else {
-        extract_tar_gz(body, dest);
+    let actual = format!("{:x}", Sha256::digest(&bytes));
+    if let Some(expected) = expected {
+        integrity::verify_digest(&asset, expected, &actual).unwrap_or_else(|e| panic!("{e}"));
     }
 
-    // Verify the expected library file exists after extraction.
-    let lib = dest.join(lib_filename(target));
-    assert!(
-        lib.exists(),
-        "Expected library file not found after extraction: {}",
-        lib.display()
-    );
+    if let Err(e) = extract_ffi_archive(&bytes, target, dest) {
+        let _ = fs::remove_dir_all(dest);
+        panic!("{e}");
+    }
+    if let Err(e) = fs::write(dest.join(ARCHIVE_STAMP), format!("{actual}\n")) {
+        let _ = fs::remove_dir_all(dest);
+        panic!("Failed to write archive checksum stamp: {e}");
+    }
 }
 
-/// Extract a `.tar.gz` archive into `dest`.
-fn extract_tar_gz(reader: impl io::Read, dest: &Path) {
+/// Wipe `dest`, extract allowlisted members, require the static lib.
+fn extract_ffi_archive(bytes: &[u8], target: &str, dest: &Path) -> Result<(), String> {
+    if dest.exists() {
+        fs::remove_dir_all(dest).map_err(|e| format!("Failed to clear {}: {e}", dest.display()))?;
+    }
+    fs::create_dir_all(dest).map_err(|e| format!("Failed to create {}: {e}", dest.display()))?;
+    let cursor = io::Cursor::new(bytes);
+    if target.contains("windows") {
+        extract_zip(cursor, dest)?;
+    } else {
+        extract_tar_gz(cursor, dest)?;
+    }
+    let lib = dest.join(lib_filename(target));
+    if !lib.exists() {
+        return Err(format!(
+            "Expected library file not found after extraction: {}",
+            lib.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Extract a `.tar.gz` archive into `dest`. Rejects path traversal and unexpected entries.
+fn extract_tar_gz(reader: impl io::Read, dest: &Path) -> Result<(), String> {
     let decoder = flate2::read::GzDecoder::new(reader);
     let mut archive = tar::Archive::new(decoder);
-    archive
-        .unpack(dest)
-        .expect("Failed to extract tar.gz archive");
+    let entries = archive
+        .entries()
+        .map_err(|e| format!("Failed to read tar.gz archive: {e}"))?;
+    for entry in entries {
+        let mut entry = entry.map_err(|e| format!("Failed to read tar entry: {e}"))?;
+        let kind = entry.header().entry_type();
+        if kind.is_dir() {
+            continue;
+        }
+        let name = {
+            let path = entry
+                .path()
+                .map_err(|e| format!("Failed to read tar entry path: {e}"))?;
+            path.to_string_lossy().into_owned()
+        };
+        if kind.is_symlink() || kind.is_hard_link() {
+            return Err(format!("Refusing to extract link from FFI tar: {name}"));
+        }
+        if !kind.is_file() {
+            return Err(format!("Refusing non-file tar entry {name:?} ({kind:?})"));
+        }
+        write_allowed_entry(&name, dest, &mut entry)?;
+    }
+    Ok(())
 }
 
-/// Extract a `.zip` archive into `dest`.
-fn extract_zip(reader: impl io::Read, dest: &Path) {
-    // zip crate requires Read + Seek, so buffer to a temp file first.
-    let tmp = dest.join("__download.zip");
-    {
-        let mut file = fs::File::create(&tmp).expect("Failed to create temp zip file");
-        let mut reader = reader;
-        io::copy(&mut reader, &mut file).expect("Failed to write zip data");
+/// Extract a `.zip` archive into `dest`. Rejects path traversal and unexpected entries.
+fn extract_zip(reader: impl io::Read + io::Seek, dest: &Path) -> Result<(), String> {
+    let mut archive =
+        zip::ZipArchive::new(reader).map_err(|e| format!("Failed to read zip archive: {e}"))?;
+    for i in 0..archive.len() {
+        let mut file = archive
+            .by_index(i)
+            .map_err(|e| format!("Failed to read zip entry {i}: {e}"))?;
+        if file.is_dir() {
+            continue;
+        }
+        let name = file.name().to_owned();
+        if file.is_symlink() {
+            return Err(format!("Refusing to extract symlink from FFI zip: {name}"));
+        }
+        write_allowed_entry(&name, dest, &mut file)?;
     }
+    Ok(())
+}
 
-    let file = fs::File::open(&tmp).expect("Failed to open temp zip file");
-    let mut archive = zip::ZipArchive::new(file).expect("Failed to read zip archive");
-    archive
-        .extract(dest)
-        .expect("Failed to extract zip archive");
-
-    let _ = fs::remove_file(&tmp);
+fn write_allowed_entry(name: &str, dest: &Path, reader: &mut impl io::Read) -> Result<(), String> {
+    let Some(safe) = integrity::safe_archive_entry_name(name) else {
+        return Err(format!(
+            "Refusing archive entry {name:?}: path traversal or unexpected file"
+        ));
+    };
+    let out = dest.join(safe);
+    let mut outfile =
+        fs::File::create(&out).map_err(|e| format!("Failed to create {}: {e}", out.display()))?;
+    io::copy(reader, &mut outfile)
+        .map_err(|e| format!("Failed to extract {}: {e}", out.display()))?;
+    Ok(())
 }
 
 /// Locate the C header file relative to a local FFI directory.

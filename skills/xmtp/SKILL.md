@@ -15,7 +15,9 @@ built from this repository (`cargo build -p xmtp-cli`).
 
 ## Profile Setup
 
-Profiles store identity keys and message databases. A default profile is
+Profiles store identity keys and an encrypted message database (`db.key`).
+Profile directories are created mode 0700; `identity.key` and `db.key` are
+0600. A profile without `db.key` is rejected. A default profile is
 auto-created on first TUI launch, but agents should create one explicitly.
 
 ```bash
@@ -130,6 +132,32 @@ xmtp request <conversation_id> deny --json
 xmtp can-message 0xAddr1 0xAddr2 --json
 # → {"results":[{"address":"0xAddr1","can_message":true},{"address":"0xAddr2","can_message":false}]}
 ```
+
+## History Transfer and Archives
+
+History-sync URL defaults from the profile env (`Env::history_sync_url`).
+Override with `--history-url`. File archives default to the profile `db.key`;
+pass `--key HEX` (32 bytes) to override.
+
+```bash
+# Ask another installation to send history
+xmtp sync --json
+xmtp sync --history-url https://message-history.dev.ephemera.network --json
+# → {"ok":true,"history_url":"https://..."}
+
+# Local encrypted archive
+xmtp archive create ./backup.xmtp --json
+xmtp archive import ./backup.xmtp --json
+xmtp archive metadata ./backup.xmtp --json
+
+# Archives advertised in the device-sync group
+xmtp archive list --json
+xmtp archive process --json
+xmtp archive process --pin PIN --json
+xmtp archive send PIN --json
+```
+
+FFI tracing: `RUST_LOG=debug xmtp …`. `xmtp --version` includes libxmtp.
 
 ## Real-Time Streaming
 

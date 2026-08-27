@@ -3,6 +3,8 @@
 use std::cell::RefCell;
 use std::ffi::{CStr, CString, c_char};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicPtr, Ordering};
+
 use tokio::runtime::Runtime;
 
 // ---------------------------------------------------------------------------
@@ -41,9 +43,18 @@ pub struct FfiSignatureRequest {
         std::sync::Arc<Box<dyn xmtp_id::scw_verifier::SmartContractSignatureVerifier>>,
 }
 
+/// Joinable stream task. `xmtp_stream_free` does not wait on this.
+pub(crate) type FfiJoinHandle = Box<
+    dyn xmtp_common::StreamHandle<
+            StreamOutput = std::result::Result<(), xmtp_mls::subscriptions::SubscribeError>,
+        > + Send,
+>;
+
 /// Opaque stream handle.
 pub struct FfiStreamHandle {
     pub(crate) abort: std::sync::Arc<Box<dyn xmtp_common::AbortHandle>>,
+    /// Joinable task. `xmtp_stream_join` takes this; `xmtp_stream_free` leaks it if still present.
+    pub(crate) join: std::sync::Mutex<Option<FfiJoinHandle>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -251,6 +262,21 @@ pub struct FfiGroupMemberList {
     pub(crate) items: Vec<FfiGroupMember>,
 }
 
+impl Drop for FfiGroupMember {
+    fn drop(&mut self) {
+        if !self.inbox_id.is_null() {
+            drop(unsafe { CString::from_raw(self.inbox_id) });
+            self.inbox_id = std::ptr::null_mut();
+        }
+        free_c_string_array(self.account_identifiers, self.account_identifiers_count);
+        self.account_identifiers = std::ptr::null_mut();
+        self.account_identifiers_count = 0;
+        free_c_string_array(self.installation_ids, self.installation_ids_count);
+        self.installation_ids = std::ptr::null_mut();
+        self.installation_ids_count = 0;
+    }
+}
+
 /// A single inbox state entry (batch query result).
 #[repr(C)]
 pub struct FfiInboxStateItem {
@@ -267,6 +293,35 @@ pub struct FfiInboxStateItem {
 /// A list of inbox states.
 pub struct FfiInboxStateList {
     pub(crate) items: Vec<FfiInboxStateItem>,
+}
+
+impl Drop for FfiInboxStateItem {
+    fn drop(&mut self) {
+        if !self.inbox_id.is_null() {
+            drop(unsafe { CString::from_raw(self.inbox_id) });
+            self.inbox_id = std::ptr::null_mut();
+        }
+        if !self.recovery_identifier.is_null() {
+            drop(unsafe { CString::from_raw(self.recovery_identifier) });
+            self.recovery_identifier = std::ptr::null_mut();
+        }
+        free_c_string_array(self.identifiers, self.identifiers_count);
+        self.identifiers = std::ptr::null_mut();
+        self.identifiers_count = 0;
+        free_c_string_array(self.installation_ids, self.installation_ids_count);
+        self.installation_ids = std::ptr::null_mut();
+        if !self.installation_client_timestamps.is_null() && self.installation_ids_count > 0 {
+            drop(unsafe {
+                Vec::from_raw_parts(
+                    self.installation_client_timestamps,
+                    self.installation_ids_count as usize,
+                    self.installation_ids_count as usize,
+                )
+            });
+            self.installation_client_timestamps = std::ptr::null_mut();
+        }
+        self.installation_ids_count = 0;
+    }
 }
 
 /// A consent record exposed to C.
@@ -365,6 +420,38 @@ pub struct FfiHmacKeyMap {
     pub(crate) entries: Vec<FfiHmacKeyEntry>,
 }
 
+impl Drop for FfiHmacKey {
+    fn drop(&mut self) {
+        if !self.key.is_null() && self.key_len > 0 {
+            drop(unsafe {
+                Vec::from_raw_parts(self.key, self.key_len as usize, self.key_len as usize)
+            });
+            self.key = std::ptr::null_mut();
+            self.key_len = 0;
+        }
+    }
+}
+
+impl Drop for FfiHmacKeyEntry {
+    fn drop(&mut self) {
+        if !self.group_id.is_null() {
+            drop(unsafe { CString::from_raw(self.group_id) });
+            self.group_id = std::ptr::null_mut();
+        }
+        if !self.keys.is_null() && self.keys_count > 0 {
+            drop(unsafe {
+                Vec::from_raw_parts(
+                    self.keys,
+                    self.keys_count as usize,
+                    self.keys_count as usize,
+                )
+            });
+            self.keys = std::ptr::null_mut();
+            self.keys_count = 0;
+        }
+    }
+}
+
 /// Options for device sync archive operations.
 #[repr(C)]
 pub struct FfiArchiveOptions {
@@ -393,6 +480,26 @@ pub struct FfiAvailableArchiveList {
     pub(crate) items: Vec<FfiAvailableArchive>,
 }
 
+impl Drop for FfiAvailableArchive {
+    fn drop(&mut self) {
+        if !self.pin.is_null() {
+            drop(unsafe { CString::from_raw(self.pin) });
+            self.pin = std::ptr::null_mut();
+        }
+        if !self.sent_by_installation.is_null() && self.sent_by_installation_len > 0 {
+            drop(unsafe {
+                Vec::from_raw_parts(
+                    self.sent_by_installation,
+                    self.sent_by_installation_len as usize,
+                    self.sent_by_installation_len as usize,
+                )
+            });
+            self.sent_by_installation = std::ptr::null_mut();
+            self.sent_by_installation_len = 0;
+        }
+    }
+}
+
 /// Opaque handle for gateway authentication credentials.
 pub struct FfiAuthHandle {
     pub(crate) inner: xmtp_api_d14n::AuthHandle,
@@ -418,6 +525,19 @@ pub struct FfiKeyPackageStatusList {
     pub(crate) items: Vec<FfiKeyPackageStatus>,
 }
 
+impl Drop for FfiKeyPackageStatus {
+    fn drop(&mut self) {
+        if !self.installation_id.is_null() {
+            drop(unsafe { CString::from_raw(self.installation_id) });
+            self.installation_id = std::ptr::null_mut();
+        }
+        if !self.validation_error.is_null() {
+            drop(unsafe { CString::from_raw(self.validation_error) });
+            self.validation_error = std::ptr::null_mut();
+        }
+    }
+}
+
 /// Inbox update count entry (inbox_id → count).
 #[repr(C)]
 pub struct FfiInboxUpdateCount {
@@ -430,12 +550,30 @@ pub struct FfiInboxUpdateCountList {
     pub(crate) items: Vec<FfiInboxUpdateCount>,
 }
 
+impl Drop for FfiInboxUpdateCount {
+    fn drop(&mut self) {
+        if !self.inbox_id.is_null() {
+            drop(unsafe { CString::from_raw(self.inbox_id) });
+            self.inbox_id = std::ptr::null_mut();
+        }
+    }
+}
+
 /// Group metadata (creator + conversation type).
 #[repr(C)]
 pub struct FfiGroupMetadata {
     /// Creator inbox ID (owned string).
     pub creator_inbox_id: *mut c_char,
     pub conversation_type: FfiConversationType,
+}
+
+impl Drop for FfiGroupMetadata {
+    fn drop(&mut self) {
+        if !self.creator_inbox_id.is_null() {
+            drop(unsafe { CString::from_raw(self.creator_inbox_id) });
+            self.creator_inbox_id = std::ptr::null_mut();
+        }
+    }
 }
 
 /// Permission policy set for a conversation.
@@ -498,6 +636,35 @@ pub struct FfiEnrichedMessageList {
     pub(crate) items: Vec<FfiEnrichedMessage>,
 }
 
+impl Drop for FfiEnrichedMessage {
+    fn drop(&mut self) {
+        for p in [
+            &mut self.id,
+            &mut self.group_id,
+            &mut self.sender_inbox_id,
+            &mut self.sender_installation_id,
+            &mut self.content_type,
+            &mut self.fallback_text,
+        ] {
+            if !p.is_null() {
+                drop(unsafe { CString::from_raw(*p) });
+                *p = std::ptr::null_mut();
+            }
+        }
+        if !self.content_bytes.is_null() && self.content_bytes_len > 0 {
+            drop(unsafe {
+                Vec::from_raw_parts(
+                    self.content_bytes,
+                    self.content_bytes_len as usize,
+                    self.content_bytes_len as usize,
+                )
+            });
+            self.content_bytes = std::ptr::null_mut();
+            self.content_bytes_len = 0;
+        }
+    }
+}
+
 /// Last-read-time entry (inbox_id → timestamp_ns).
 #[repr(C)]
 pub struct FfiLastReadTimeEntry {
@@ -508,6 +675,15 @@ pub struct FfiLastReadTimeEntry {
 /// A list of last-read-time entries.
 pub struct FfiLastReadTimeList {
     pub(crate) items: Vec<FfiLastReadTimeEntry>,
+}
+
+impl Drop for FfiLastReadTimeEntry {
+    fn drop(&mut self) {
+        if !self.inbox_id.is_null() {
+            drop(unsafe { CString::from_raw(self.inbox_id) });
+            self.inbox_id = std::ptr::null_mut();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -609,6 +785,8 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<(), Box<dyn std::error::Error>>>,
 {
+    // Apple staticlib does not run rustls' ctor; first HTTPS otherwise panics.
+    xmtp_cryptography::install_crypto_provider();
     catch(|| match tokio::runtime::Handle::try_current() {
         Ok(handle) => tokio::task::block_in_place(|| handle.block_on(f())),
         Err(_) => runtime().block_on(f()),
@@ -619,11 +797,46 @@ where
 // Shared tokio runtime
 // ---------------------------------------------------------------------------
 
-static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+static RUNTIME: AtomicPtr<Runtime> = AtomicPtr::new(std::ptr::null_mut());
 
 /// Get or initialize the global tokio runtime.
 pub(crate) fn runtime() -> &'static Runtime {
-    RUNTIME.get_or_init(|| Runtime::new().expect("failed to create tokio runtime"))
+    xmtp_cryptography::install_crypto_provider();
+    let existing = RUNTIME.load(Ordering::Acquire);
+    // SAFETY: `existing` is null or a `Box::into_raw` pointer from this function.
+    if let Some(rt) = unsafe { existing.as_ref() } {
+        return rt;
+    }
+    let raw = Box::into_raw(Box::new(
+        Runtime::new().expect("failed to create tokio runtime"),
+    ));
+    match RUNTIME.compare_exchange(
+        std::ptr::null_mut(),
+        raw,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => {
+            // SAFETY: `raw` won the race and is a valid `Runtime`.
+            unsafe { &*raw }
+        }
+        Err(winner) => {
+            // SAFETY: this thread's `raw` was not stored; unique ownership.
+            drop(unsafe { Box::from_raw(raw) });
+            // SAFETY: `winner` is the stored `Box::into_raw` pointer.
+            unsafe { &*winner }
+        }
+    }
+}
+
+/// Drop the process-global tokio runtime (cdylib unload). Further FFI calls recreate it.
+#[unsafe(no_mangle)]
+pub extern "C" fn xmtp_shutdown() {
+    let p = RUNTIME.swap(std::ptr::null_mut(), Ordering::AcqRel);
+    if !p.is_null() {
+        // SAFETY: `p` was stored by `runtime` via `Box::into_raw`, or is unique after swap.
+        drop(unsafe { Box::from_raw(p) });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -650,11 +863,79 @@ pub(crate) unsafe fn c_str_to_option(
     Ok(Some(unsafe { CStr::from_ptr(s) }.to_str()?.to_owned()))
 }
 
+/// libxmtp infers TLS from the URL scheme. Prefix when the host has none.
+pub(crate) fn host_with_scheme(host: String, is_secure: bool) -> String {
+    if host.contains("://") {
+        host
+    } else if is_secure {
+        format!("https://{host}")
+    } else {
+        format!("http://{host}")
+    }
+}
+
+/// Untrusted C buffer. Null or negative → Err. `len == 0` → Ok(&[]).
+/// Never `as usize` on a negative i32.
+pub(crate) fn checked_slice<'a, T>(
+    ptr: *const T,
+    len: i32,
+) -> Result<&'a [T], Box<dyn std::error::Error>> {
+    if ptr.is_null() {
+        return Err("null pointer".into());
+    }
+    if len < 0 {
+        return Err("negative length".into());
+    }
+    if len == 0 {
+        return Ok(&[]);
+    }
+    // SAFETY: null/negative rejected; caller must pass `len` valid `T`s.
+    Ok(unsafe { std::slice::from_raw_parts(ptr, len as usize) })
+}
+
+/// Required payload. Null, negative, or 0 → Err.
+pub(crate) fn checked_slice_nonempty<'a, T>(
+    ptr: *const T,
+    len: i32,
+) -> Result<&'a [T], Box<dyn std::error::Error>> {
+    let slice = checked_slice(ptr, len)?;
+    if slice.is_empty() {
+        return Err("empty buffer".into());
+    }
+    Ok(slice)
+}
+
+/// 32-byte DB/archive key. Null or `len != 32` → Err.
+pub(crate) fn checked_key32<'a>(
+    ptr: *const u8,
+    len: i32,
+) -> Result<&'a [u8; 32], Box<dyn std::error::Error>> {
+    if ptr.is_null() || len != 32 {
+        return Err("key must be 32 bytes".into());
+    }
+    let slice = checked_slice(ptr, 32)?;
+    slice.try_into().map_err(|_| "key must be 32 bytes".into())
+}
+
+/// Convert to an owned `CString`. Fails on interior NUL without leaking.
+pub(crate) fn to_cstring(s: &str) -> Result<CString, Box<dyn std::error::Error>> {
+    CString::new(s).map_err(|_| "string contains interior NUL".into())
+}
+
 /// Allocate a new C string from a Rust `&str`. Caller must free with [`xmtp_free_string`].
-pub(crate) fn to_c_string(s: &str) -> *mut c_char {
-    CString::new(s)
-        .map(CString::into_raw)
-        .unwrap_or(std::ptr::null_mut())
+pub(crate) fn to_c_string(s: &str) -> Result<*mut c_char, Box<dyn std::error::Error>> {
+    Ok(to_cstring(s)?.into_raw())
+}
+
+/// Pointer-returning FFI: record last error on interior NUL instead of swallowing it.
+pub(crate) fn to_c_string_or_null(s: &str) -> *mut c_char {
+    match to_c_string(s) {
+        Ok(p) => p,
+        Err(e) => {
+            set_last_error(e.to_string());
+            std::ptr::null_mut()
+        }
+    }
 }
 
 /// Free a string previously returned by this library.
@@ -683,6 +964,14 @@ pub(crate) unsafe fn ref_from<'a, T>(ptr: *const T) -> Result<&'a T, Box<dyn std
         return Err("null handle".into());
     }
     Ok(unsafe { &*ptr })
+}
+
+/// Validate a pointer and create a mutable reference.
+pub(crate) unsafe fn mut_from<'a, T>(ptr: *mut T) -> Result<&'a mut T, Box<dyn std::error::Error>> {
+    if ptr.is_null() {
+        return Err("null handle".into());
+    }
+    Ok(unsafe { &mut *ptr })
 }
 
 /// Box a value and return a raw pointer.
@@ -722,44 +1011,59 @@ pub(crate) unsafe fn parse_identifier(
 }
 
 /// Collect parallel arrays of identifiers and kinds into `Vec<Identifier>`.
+/// `count == 0` is an empty list (pointer may be null). Null with `count > 0` is an error.
 pub(crate) unsafe fn collect_identifiers(
     ptrs: *const *const c_char,
     kinds: *const i32,
     count: i32,
 ) -> Result<Vec<xmtp_id::associations::Identifier>, Box<dyn std::error::Error>> {
-    if ptrs.is_null() || kinds.is_null() || count <= 0 {
-        return Err("null pointer or invalid count".into());
+    if count == 0 {
+        return Ok(Vec::new());
     }
-    (0..count as usize)
-        .map(|i| unsafe { parse_identifier(*ptrs.add(i), *kinds.add(i)) })
+    let ptrs = checked_slice_nonempty(ptrs, count)?;
+    let kinds = checked_slice_nonempty(kinds, count)?;
+    ptrs.iter()
+        .zip(kinds.iter())
+        .map(|(&p, &kind)| unsafe { parse_identifier(p, kind) })
         .collect()
 }
 
 /// Collect an array of C strings into `Vec<String>`.
+/// `count == 0` is an empty list (pointer may be null). Null with `count > 0` is an error.
 pub(crate) unsafe fn collect_strings(
     ptrs: *const *const c_char,
     count: i32,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    if ptrs.is_null() || count <= 0 {
-        return Err("null pointer or invalid count".into());
+    if count == 0 {
+        return Ok(Vec::new());
     }
-    (0..count as usize)
-        .map(|i| unsafe { c_str_to_string(*ptrs.add(i)) })
+    let ptrs = checked_slice_nonempty(ptrs, count)?;
+    ptrs.iter()
+        .map(|&p| unsafe { c_str_to_string(p) })
         .collect()
 }
 
 /// Convert a `Vec<String>` into a heap-allocated C string array.
 /// Caller must free each string and the array itself.
-pub(crate) fn string_vec_to_c(v: Vec<String>, out_count: *mut i32) -> *mut *mut c_char {
-    let count = v.len();
-    let ptrs: Vec<*mut c_char> = v.into_iter().map(|s| to_c_string(&s)).collect();
-    // Use into_boxed_slice to guarantee cap == len, avoiding UB in from_raw_parts
-    let boxed = ptrs.into_boxed_slice();
-    let ptr = Box::into_raw(boxed) as *mut *mut c_char;
+pub(crate) fn string_vec_to_c(
+    v: Vec<String>,
+    out_count: *mut i32,
+) -> Result<*mut *mut c_char, Box<dyn std::error::Error>> {
+    if out_count.is_null() {
+        return Err("null output pointer".into());
+    }
+    let owned: Vec<CString> = v.iter().map(|s| to_cstring(s)).collect::<Result<_, _>>()?;
+    let count = owned.len();
     unsafe {
         *out_count = count as i32;
     }
-    ptr
+    if owned.is_empty() {
+        return Ok(std::ptr::null_mut());
+    }
+    let ptrs: Vec<*mut c_char> = owned.into_iter().map(CString::into_raw).collect();
+    // Use into_boxed_slice to guarantee cap == len, avoiding UB in from_raw_parts
+    let boxed = ptrs.into_boxed_slice();
+    Ok(Box::into_raw(boxed) as *mut *mut c_char)
 }
 
 // ---------------------------------------------------------------------------
@@ -842,22 +1146,6 @@ macro_rules! free_c_strings {
     };
 }
 
-/// Generate a free function for a list type whose items only contain owned C strings.
-macro_rules! ffi_list_free {
-    ($fn_name:ident, $list_ty:ty, [$($field:ident),+ $(,)?]) => {
-        #[unsafe(no_mangle)]
-        pub unsafe extern "C" fn $fn_name(list: *mut $list_ty) {
-            if list.is_null() {
-                return;
-            }
-            let l = unsafe { Box::from_raw(list) };
-            for item in &l.items {
-                $crate::ffi::free_c_strings!(item, $($field),+);
-            }
-        }
-    };
-}
-
 /// Generate a conversation string property getter (returns `*mut c_char`).
 /// Inner method must return `Result<String, _>`.
 macro_rules! conv_string_getter {
@@ -868,7 +1156,7 @@ macro_rules! conv_string_getter {
         ) -> *mut std::ffi::c_char {
             match unsafe { $crate::ffi::ref_from(conv) } {
                 Ok(c) => match c.inner.$method() {
-                    Ok(s) => $crate::ffi::to_c_string(&s),
+                    Ok(s) => $crate::ffi::to_c_string_or_null(&s),
                     Err(_) => std::ptr::null_mut(),
                 },
                 Err(_) => std::ptr::null_mut(),
@@ -910,7 +1198,14 @@ macro_rules! conv_string_list_getter {
             }
             match unsafe { $crate::ffi::ref_from(conv) } {
                 Ok(c) => match c.inner.$method() {
-                    Ok(list) => $crate::ffi::string_vec_to_c(list, out_count),
+                    Ok(list) => match $crate::ffi::string_vec_to_c(list, out_count) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            $crate::ffi::set_last_error(e.to_string());
+                            unsafe { *out_count = 0 };
+                            std::ptr::null_mut()
+                        }
+                    },
                     Err(_) => {
                         unsafe { *out_count = 0 };
                         std::ptr::null_mut()
@@ -954,7 +1249,6 @@ pub(crate) use conv_inbox_check;
 pub(crate) use conv_string_getter;
 pub(crate) use conv_string_list_getter;
 pub(crate) use conv_string_setter;
-pub(crate) use ffi_list_free;
 pub(crate) use ffi_list_get;
 pub(crate) use ffi_list_len;
 pub(crate) use free_c_strings;
@@ -1011,7 +1305,7 @@ pub(crate) fn consent_record_to_c(
     FfiConsentRecord {
         entity_type: consent_type_to_ffi(r.entity_type),
         state: consent_state_to_ffi(r.state),
-        entity: to_c_string(&r.entity),
+        entity: to_c_string_or_null(&r.entity),
     }
 }
 
@@ -1042,19 +1336,17 @@ pub(crate) fn i32_to_content_type(v: i32) -> Option<xmtp_db::group_message::Cont
 
 /// Parse a consent state filter from a raw int array. Shared by conversations and streams.
 ///
-/// # Safety
-///
-/// `states` must point to a valid array of at least `count` `i32` values.
+/// `null` or `count == 0` → `Ok(None)` (no filter). Negative `count` → `Err`.
 pub(crate) fn parse_consent_states(
     states: *const i32,
     count: i32,
-) -> Option<Vec<xmtp_db::consent_record::ConsentState>> {
-    if states.is_null() || count <= 0 {
-        return None;
+) -> Result<Option<Vec<xmtp_db::consent_record::ConsentState>>, Box<dyn std::error::Error>> {
+    if states.is_null() || count == 0 {
+        return Ok(None);
     }
-    let mut result = Vec::with_capacity(count as usize);
-    for i in 0..count as usize {
-        let s = unsafe { *states.add(i) };
+    let slice = checked_slice(states, count)?;
+    let mut result = Vec::with_capacity(slice.len());
+    for &s in slice {
         result.push(match s {
             0 => xmtp_db::consent_record::ConsentState::Unknown,
             1 => xmtp_db::consent_record::ConsentState::Allowed,
@@ -1063,9 +1355,9 @@ pub(crate) fn parse_consent_states(
         });
     }
     if result.is_empty() {
-        None
+        Ok(None)
     } else {
-        Some(result)
+        Ok(Some(result))
     }
 }
 
@@ -1109,4 +1401,102 @@ pub unsafe extern "C" fn xmtp_init_logger(level: *const c_char) -> i32 {
         });
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checked_slice_len_zero_ok_empty() {
+        let p = std::ptr::NonNull::<u8>::dangling().as_ptr();
+        let s = checked_slice::<u8>(p, 0).unwrap();
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn checked_slice_null_or_negative_err() {
+        assert!(checked_slice::<u8>(std::ptr::null(), 0).is_err());
+        assert!(checked_slice::<u8>(std::ptr::null(), 4).is_err());
+        let buf = [1u8, 2];
+        assert!(checked_slice(buf.as_ptr(), -1).is_err());
+        assert_eq!(checked_slice(buf.as_ptr(), 2).unwrap(), &buf);
+    }
+
+    #[test]
+    fn checked_slice_nonempty_rejects_zero() {
+        let p = std::ptr::NonNull::<u8>::dangling().as_ptr();
+        assert!(checked_slice_nonempty::<u8>(p, 0).is_err());
+        let buf = [1u8];
+        assert_eq!(checked_slice_nonempty(buf.as_ptr(), 1).unwrap(), &[1]);
+    }
+
+    #[test]
+    fn checked_key32_len_not_32_err() {
+        let short = [0u8; 16];
+        assert!(checked_key32(short.as_ptr(), 16).is_err());
+        assert!(checked_key32(std::ptr::null(), 32).is_err());
+        assert!(checked_key32(short.as_ptr(), -1).is_err());
+        let key = [7u8; 32];
+        assert_eq!(checked_key32(key.as_ptr(), 32).unwrap(), &key);
+    }
+
+    #[test]
+    fn parse_consent_states_empty_is_none_not_err() {
+        assert!(parse_consent_states(std::ptr::null(), 0).unwrap().is_none());
+        let empty: [i32; 0] = [];
+        assert!(parse_consent_states(empty.as_ptr(), 0).unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_consent_states_negative_is_err() {
+        let s = [1i32];
+        assert!(parse_consent_states(s.as_ptr(), -1).is_err());
+    }
+
+    #[test]
+    fn parse_consent_states_values() {
+        let s = [1i32, 2, 99];
+        let got = parse_consent_states(s.as_ptr(), 3).unwrap().unwrap();
+        assert_eq!(got.len(), 2);
+    }
+
+    #[test]
+    fn to_c_string_rejects_interior_nul() {
+        let p = to_c_string("ok").unwrap();
+        unsafe { xmtp_free_string(p) };
+        assert!(to_c_string("bad\0nul").is_err());
+        assert!(to_c_string_or_null("bad\0nul").is_null());
+        assert!(xmtp_last_error_length() > 0);
+    }
+
+    #[test]
+    fn host_with_scheme_prefixes_when_missing() {
+        assert_eq!(
+            host_with_scheme("grpc.example:443".into(), true),
+            "https://grpc.example:443"
+        );
+        assert_eq!(
+            host_with_scheme("localhost:5556".into(), false),
+            "http://localhost:5556"
+        );
+        assert_eq!(
+            host_with_scheme("https://grpc.example:443".into(), false),
+            "https://grpc.example:443"
+        );
+        assert_eq!(
+            host_with_scheme("http://localhost:5556".into(), true),
+            "http://localhost:5556"
+        );
+    }
+
+    #[test]
+    fn collect_strings_count_zero_is_empty_ok() {
+        let got = unsafe { collect_strings(std::ptr::null(), 0) }.unwrap();
+        assert!(got.is_empty());
+        let p = std::ptr::NonNull::<*const c_char>::dangling().as_ptr();
+        let got = unsafe { collect_strings(p, 0) }.unwrap();
+        assert!(got.is_empty());
+        assert!(unsafe { collect_strings(std::ptr::null(), 2) }.is_err());
+    }
 }

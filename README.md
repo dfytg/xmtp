@@ -60,7 +60,7 @@ irm https://sh.qntx.org/xmtp/ps | iex
 
 ```bash
 
-# Create a profile (generates a new key, registers with XMTP)
+# Create a profile (generates a new key, encrypted local DB, registers with XMTP)
 xmtp new alice
 
 # Create a profile with a Ledger hardware wallet
@@ -83,6 +83,21 @@ xmtp clear         # delete ALL profiles
 
 # Revoke all other installations (requires wallet signature)
 xmtp revoke alice
+
+# Request history from another installation (URL from env; override with --history-url)
+xmtp sync
+xmtp sync --history-url https://message-history.dev.ephemera.network
+
+# Local device-sync archives (encrypted with db.key unless --key is given)
+xmtp archive create ./alice.xmtp
+xmtp archive import ./alice.xmtp
+xmtp archive metadata ./alice.xmtp
+xmtp archive list
+xmtp archive process
+xmtp archive send PIN
+
+# FFI tracing: RUST_LOG=debug xmtp …
+# xmtp --version includes the libxmtp version
 ```
 
 ### Linking
@@ -116,7 +131,7 @@ for c in &convs {
 
 - **xmtp** — High-level SDK. Owns all unsafe FFI calls behind safe types. `Client` is built via `ClientBuilder` with optional signer, ENS resolver, and environment selection. `Conversation` provides send/receive/sync/metadata/consent operations. Content codecs handle text, markdown, reactions, replies, attachments, and read receipts.
 - **xmtp-sys** — Auto-generated bindings from `xmtp_ffi.h`. Downloads pre-built static libraries at build time. No `libclang` required for end users.
-- **xmtp-cli** — Profile-based TUI chat client. Profiles persist configuration (environment, signer type, wallet address) in platform data directories. Signer is only required for identity-changing operations (`new`, `revoke`); TUI and `info` operate without it.
+- **xmtp-cli** — Profile-based TUI chat client. Profiles persist configuration (environment, signer type, wallet address) in platform data directories. New profiles always encrypt the local DB (`db.key` mode 0600, profile dir 0700). Unencrypted profiles are refused. Signer is only required for identity-changing operations (`new`, `revoke`); TUI and `info` operate without it.
 
 ## Feature Flags
 
@@ -209,17 +224,18 @@ Each installation tracks a **cursor** (bookmark) per conversation. `sync()` only
 
 A new installation cannot decrypt messages sent before it joined the MLS group. To access historical messages, XMTP provides [History Transfer](https://docs.xmtp.org/chat-apps/list-stream-sync/history-sync) (defined in [XIP-64](https://github.com/xmtp/XIPs/blob/main/XIPs/xip-64-history-transfer.md)):
 
-1. **New device** requests history via the sync group (`initiateHistoryRequest`)
+1. **New device** calls `Client::send_sync_request` (URL from `Env::history_sync_url()` or `ClientBuilder::history_sync_url`)
 2. **Existing device** (must be online) prepares and uploads an encrypted archive to the history server
-3. **New device** downloads and imports the archive into its local database
+3. **New device** downloads and imports the archive (`process_sync_archive` / `import_archive`)
 
 Key details:
 
-- History transfer is **enabled by default** — the SDK sets `historySyncUrl` to an XMTP Labs-hosted server based on your `env` setting
+- `ClientBuilder::build()` does **not** send a history-sync request. Call `send_sync_request` (or `send_sync_request_to`) explicitly.
+- Default server URL is `Env::history_sync_url()` (XMTP Labs hosts per env). Override with `ClientBuilder::history_sync_url` or `send_sync_request_to`.
+- Disable the device-sync worker with `ClientBuilder::disable_device_sync()`. Empty-string URL is not a disable switch.
 - The encrypted payload is stored on the history server for **24 hours** only
 - The archive includes conversations, messages, consent state, and HMAC keys
 - **If all installations are lost**, message history is unrecoverable (no server-side plaintext storage)
-- You can self-host the history server or disable it by setting `historySyncUrl` to an empty string
 
 ## Supported Platforms
 
@@ -230,6 +246,8 @@ Key details:
 | `aarch64-apple-darwin` | ✅ |
 | `x86_64-pc-windows-msvc` | ✅ |
 | `aarch64-pc-windows-msvc` | ✅ |
+
+Intel macOS (`x86_64-apple-darwin`) is unsupported.
 
 ## Security
 

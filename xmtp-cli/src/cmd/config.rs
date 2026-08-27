@@ -1,6 +1,6 @@
 //! Profile configuration persistence and shared infrastructure.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::{fmt, fs};
 
 use xmtp::{AlloySigner, Client, EnsResolver, Env, IdentifierKind, LedgerSigner, Signer};
@@ -26,8 +26,104 @@ pub(crate) fn default_profile() -> String {
 /// Persist the default profile name.
 pub(crate) fn set_default(name: &str) -> xmtp::Result<()> {
     let base = data_dir();
-    fs::create_dir_all(&base).map_err(|e| xmtp::XmtpError::Io(format!("mkdir: {e}")))?;
+    mkdir_secret(&base)?;
     fs::write(base.join(".default"), name).map_err(|e| xmtp::XmtpError::Io(format!("write: {e}")))
+}
+
+/// Create `dir` (and parents) and set mode 0700 on Unix.
+pub(crate) fn mkdir_secret(dir: &Path) -> xmtp::Result<()> {
+    fs::create_dir_all(dir).map_err(|e| xmtp::XmtpError::Io(format!("mkdir: {e}")))?;
+    chmod(dir, 0o700)
+}
+
+/// Write `bytes` and set mode 0600 on Unix.
+pub(crate) fn write_secret(path: &Path, bytes: &[u8]) -> xmtp::Result<()> {
+    fs::write(path, bytes)
+        .map_err(|e| xmtp::XmtpError::Io(format!("write {}: {e}", path.display())))?;
+    chmod(path, 0o600)
+}
+
+/// Set Unix file mode. No-op on non-Unix.
+pub(crate) fn chmod(path: &Path, mode: u32) -> xmtp::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))
+            .map_err(|e| xmtp::XmtpError::Io(format!("chmod {}: {e}", path.display())))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+    }
+    Ok(())
+}
+
+/// 32 cryptographically random bytes.
+pub(crate) fn random_key32() -> xmtp::Result<[u8; 32]> {
+    let mut key = [0u8; 32];
+    getrandom::fill(&mut key).map_err(|e| xmtp::XmtpError::Io(format!("rng: {e}")))?;
+    Ok(key)
+}
+
+/// Decode a 32-byte key from hex (`0x` prefix optional).
+pub(crate) fn parse_hex32(s: &str) -> xmtp::Result<[u8; 32]> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    let bytes = hex::decode(s)
+        .map_err(|e| xmtp::XmtpError::InvalidArgument(format!("invalid hex: {e}")))?;
+    let len = bytes.len();
+    bytes
+        .try_into()
+        .map_err(|_| xmtp::XmtpError::InvalidArgument(format!("key must be 32 bytes, got {len}")))
+}
+
+/// Read a 32-byte key file.
+pub(crate) fn read_key32(path: &Path) -> xmtp::Result<[u8; 32]> {
+    let bytes =
+        fs::read(path).map_err(|e| xmtp::XmtpError::Io(format!("read {}: {e}", path.display())))?;
+    let len = bytes.len();
+    bytes.try_into().map_err(|_| {
+        xmtp::XmtpError::InvalidArgument(format!(
+            "key file {} must be 32 bytes, got {len}",
+            path.display()
+        ))
+    })
+}
+
+/// Load `db.key` from `dir`. Unencrypted wording only when the directory exists.
+pub(crate) fn load_db_key_at(dir: &Path, profile: &str) -> xmtp::Result<[u8; 32]> {
+    let path = dir.join("db.key");
+    if path.exists() {
+        return read_key32(&path);
+    }
+    if dir.exists() {
+        return Err(xmtp::XmtpError::InvalidArgument(format!(
+            "profile '{profile}' is missing db.key; unencrypted profiles are not supported"
+        )));
+    }
+    Err(xmtp::XmtpError::Io(format!(
+        "load config: profile '{profile}' does not exist"
+    )))
+}
+
+/// Load `db.key` for a profile. Missing file is a hard error (no plaintext DBs).
+pub(crate) fn load_db_key(profile: &str) -> xmtp::Result<[u8; 32]> {
+    load_db_key_at(&profile_dir(profile), profile)
+}
+
+/// Create a profile directory (0700) and generate `db.key` (0600).
+///
+/// Fails if `dir` already exists so a leftover DB is never re-keyed.
+pub(crate) fn init_profile_dir(dir: &Path) -> xmtp::Result<[u8; 32]> {
+    if dir.exists() {
+        return Err(xmtp::XmtpError::InvalidArgument(format!(
+            "profile directory {} already exists; remove it first with `xmtp remove`",
+            dir.display()
+        )));
+    }
+    mkdir_secret(dir)?;
+    let key = random_key32()?;
+    write_secret(&dir.join("db.key"), &key)?;
+    Ok(key)
 }
 
 /// How a profile signs messages.
@@ -94,7 +190,7 @@ impl ProfileConfig {
     /// Save to `<profile_dir>/profile.conf`.
     pub(crate) fn save(&self, profile: &str) -> xmtp::Result<()> {
         let dir = profile_dir(profile);
-        fs::create_dir_all(&dir).map_err(|e| xmtp::XmtpError::Io(format!("mkdir: {e}")))?;
+        mkdir_secret(&dir)?;
         let content = format!(
             "env={}\nrpc_url={}\nsigner={}\naddress={}\n",
             env_name(self.env),
@@ -108,22 +204,19 @@ impl ProfileConfig {
 }
 
 /// Open a profile without a signer (for TUI and info — no signing needed).
-///
-/// If the profile was created before the `address` field existed, falls back
-/// to signer-based opening once to discover and persist the address.
 pub(crate) fn open_client(profile: &str) -> xmtp::Result<(ProfileConfig, Client)> {
+    open_client_with(profile, None)
+}
+
+/// Open a profile, optionally overriding the history-sync URL.
+pub(crate) fn open_client_with(
+    profile: &str,
+    history_url: Option<&str>,
+) -> xmtp::Result<(ProfileConfig, Client)> {
     let cfg = ProfileConfig::load(profile)?;
-
-    if cfg.address.is_empty() {
-        // Legacy profile: need signer to discover wallet address.
-        let (mut migrated, signer, client) = open_with_signer(profile)?;
-        migrated.address = signer.identifier().address;
-        migrated.save(profile)?;
-        return Ok((migrated, client));
-    }
-
     let db = profile_dir(profile).join("messages.db3");
-    let client = build_client(&cfg, &db.to_string_lossy(), None)?;
+    let key = load_db_key(profile)?;
+    let client = build_client(&cfg, &db.to_string_lossy(), None, &key, history_url)?;
     Ok((cfg, client))
 }
 
@@ -136,11 +229,8 @@ pub(crate) fn open_with_signer(
 
     let signer: Box<dyn Signer> = match cfg.signer {
         SignerKind::File => {
-            let bytes = fs::read(dir.join("identity.key"))
-                .map_err(|e| xmtp::XmtpError::Io(format!("read key: {e}")))?;
-            let key: [u8; 32] = bytes
-                .try_into()
-                .map_err(|_| xmtp::XmtpError::InvalidArgument("key must be 32 bytes".into()))?;
+            let key = read_key32(&dir.join("identity.key"))?;
+            chmod(&dir.join("identity.key"), 0o600)?;
             Box::new(AlloySigner::from_bytes(&key)?)
         }
         SignerKind::Ledger(index) => {
@@ -150,21 +240,35 @@ pub(crate) fn open_with_signer(
     };
 
     let db = dir.join("messages.db3");
-    let client = build_client(&cfg, &db.to_string_lossy(), Some(signer.as_ref()))?;
+    let key = load_db_key(profile)?;
+    let client = build_client(
+        &cfg,
+        &db.to_string_lossy(),
+        Some(signer.as_ref()),
+        &key,
+        None,
+    )?;
     Ok((cfg, signer, client))
 }
 
 /// Build an XMTP client with automatic stale-DB recovery.
 ///
+/// Local DB is always encrypted with `encryption_key` (32 bytes from `db.key`).
 /// When `signer` is `Some`, uses `build(signer)` which may register.
 /// When `None`, uses `build_existing()` with the stored address (no signing).
 pub(crate) fn build_client(
     cfg: &ProfileConfig,
     db_path: &str,
     signer: Option<&dyn Signer>,
+    encryption_key: &[u8; 32],
+    history_url: Option<&str>,
 ) -> xmtp::Result<Client> {
     let build = |path: &str| {
         let mut b = Client::builder().env(cfg.env).db_path(path);
+        b = b.encryption_key(*encryption_key)?;
+        if let Some(url) = history_url {
+            b = b.history_sync_url(url);
+        }
         if let Ok(r) = EnsResolver::new(&cfg.rpc_url) {
             b = b.resolver(r);
         }
@@ -204,5 +308,140 @@ pub(crate) const fn env_name(env: Env) -> &'static str {
         Env::Dev => "dev",
         Env::Production => "production",
         Env::Local => "local",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Tmp(PathBuf);
+
+    impl Tmp {
+        fn new() -> Self {
+            let mut suffix = [0u8; 8];
+            getrandom::fill(&mut suffix).expect("rng");
+            let dir = std::env::temp_dir().join(format!("xmtp-cli-test-{}", hex::encode(suffix)));
+            fs::create_dir_all(&dir).expect("mkdir");
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            drop(fs::remove_dir_all(&self.0));
+        }
+    }
+
+    #[test]
+    fn init_profile_dir_writes_db_key_0600_dir_0700() {
+        let tmp = Tmp::new();
+        let dir = tmp.path().join("alice");
+        let key = init_profile_dir(&dir).expect("init");
+        let db_key = dir.join("db.key");
+        assert_eq!(
+            fs::metadata(&db_key).expect("db.key meta").len(),
+            32,
+            "db.key length"
+        );
+        let got = read_key32(&db_key).expect("read db.key");
+        assert_eq!(got, key, "db.key bytes");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_mode = fs::metadata(&dir).expect("dir meta").permissions().mode() & 0o777;
+            assert_eq!(dir_mode, 0o700, "profile dir mode");
+            let key_mode = fs::metadata(dir.join("db.key"))
+                .expect("key meta")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(key_mode, 0o600, "db.key mode");
+        }
+    }
+
+    #[test]
+    fn init_profile_dir_does_not_overwrite_existing() {
+        let tmp = Tmp::new();
+        let dir = tmp.path().join("alice");
+        let key = init_profile_dir(&dir).expect("init");
+        let err = init_profile_dir(&dir).expect_err("exists");
+        assert!(
+            err.to_string().contains("already exists"),
+            "{}",
+            err.to_string()
+        );
+        let got = read_key32(&dir.join("db.key")).expect("read db.key");
+        assert_eq!(got, key, "db.key not overwritten");
+    }
+
+    #[test]
+    fn write_secret_identity_key_is_0600() {
+        let tmp = Tmp::new();
+        let path = tmp.path().join("identity.key");
+        let key = random_key32().expect("rng");
+        write_secret(&path, &key).expect("write");
+        assert_eq!(read_key32(&path).expect("read"), key, "identity.key bytes");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).expect("meta").permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "identity.key mode");
+        }
+    }
+
+    #[test]
+    fn missing_db_key_on_existing_dir_is_unencrypted_error() {
+        let tmp = Tmp::new();
+        let dir = tmp.path().join("alice");
+        fs::create_dir(&dir).expect("mkdir");
+        let err = load_db_key_at(&dir, "alice").expect_err("missing key");
+        let msg = err.to_string();
+        assert!(msg.contains("db.key"), "{msg}");
+        assert!(msg.contains("unencrypted"), "{msg}");
+    }
+
+    #[test]
+    fn missing_profile_dir_is_not_unencrypted_error() {
+        let tmp = Tmp::new();
+        let dir = tmp.path().join("nope");
+        let err = load_db_key_at(&dir, "nope").expect_err("missing dir");
+        let msg = err.to_string();
+        assert!(!msg.contains("unencrypted"), "{msg}");
+        assert!(msg.contains("does not exist"), "{msg}");
+    }
+
+    #[test]
+    fn missing_db_key_file_on_disk_errors() {
+        let tmp = Tmp::new();
+        let path = tmp.path().join("db.key");
+        let err = read_key32(&path).expect_err("missing file");
+        assert!(err.to_string().contains("db.key"), "{}", err.to_string());
+    }
+
+    #[test]
+    fn db_key_wrong_length_is_error() {
+        let tmp = Tmp::new();
+        let path = tmp.path().join("db.key");
+        write_secret(&path, &[0u8; 16]).expect("write");
+        let err = read_key32(&path).expect_err("len");
+        let msg = err.to_string();
+        assert!(msg.contains("32 bytes"), "{msg}");
+    }
+
+    #[test]
+    fn parse_hex32_accepts_64_hex_and_0x_prefix() {
+        let hex64 = "ab".repeat(32);
+        let a = parse_hex32(&hex64).expect("hex");
+        let b = parse_hex32(&format!("0x{hex64}")).expect("0x");
+        assert_eq!(a, b, "prefix");
+        assert!(parse_hex32("aa").is_err(), "short");
+        assert!(parse_hex32("zz").is_err(), "not hex");
     }
 }

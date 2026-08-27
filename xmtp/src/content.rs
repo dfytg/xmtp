@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 
 use prost::Message as ProstMessage;
+use serde::Deserialize;
 
 use crate::conversation::{Conversation, Message};
 use crate::error::Result;
@@ -175,6 +176,26 @@ pub enum Content {
     Attachment(Attachment),
     /// Remote (URL-hosted) encrypted attachment.
     RemoteAttachment(RemoteAttachment),
+    /// Multiple remote attachments.
+    MultiRemoteAttachment(Vec<RemoteAttachment>),
+    /// On-chain transaction reference (`xmtp.org/transactionReference`).
+    TransactionReference(TransactionReference),
+    /// Wallet send-calls payload (`xmtp.org/walletSendCalls`). JSON on the wire.
+    WalletSendCalls(WalletSendCalls),
+    /// Inline action list (`coinbase.com/actions`). JSON on the wire.
+    Actions(Actions),
+    /// Selected action (`coinbase.com/intent`). JSON on the wire.
+    Intent(Intent),
+    /// Request to leave a group.
+    LeaveRequest {
+        /// Optional authenticated note bytes.
+        authenticated_note: Option<Vec<u8>>,
+    },
+    /// Delete another message by ID.
+    DeleteMessage {
+        /// ID of the message to delete.
+        message_id: String,
+    },
     /// Unknown or unsupported content type.
     Unknown {
         /// The content type string (e.g. `"xmtp.org/text:1.0"`).
@@ -225,6 +246,48 @@ impl Content {
     #[must_use]
     pub const fn is_remote_attachment(&self) -> bool {
         matches!(self, Self::RemoteAttachment(_))
+    }
+
+    /// Returns `true` if this is a [`Content::MultiRemoteAttachment`].
+    #[must_use]
+    pub const fn is_multi_remote_attachment(&self) -> bool {
+        matches!(self, Self::MultiRemoteAttachment(_))
+    }
+
+    /// Returns `true` if this is a [`Content::TransactionReference`].
+    #[must_use]
+    pub const fn is_transaction_reference(&self) -> bool {
+        matches!(self, Self::TransactionReference(_))
+    }
+
+    /// Returns `true` if this is a [`Content::WalletSendCalls`].
+    #[must_use]
+    pub const fn is_wallet_send_calls(&self) -> bool {
+        matches!(self, Self::WalletSendCalls(_))
+    }
+
+    /// Returns `true` if this is a [`Content::Actions`].
+    #[must_use]
+    pub const fn is_actions(&self) -> bool {
+        matches!(self, Self::Actions(_))
+    }
+
+    /// Returns `true` if this is a [`Content::Intent`].
+    #[must_use]
+    pub const fn is_intent(&self) -> bool {
+        matches!(self, Self::Intent(_))
+    }
+
+    /// Returns `true` if this is a [`Content::LeaveRequest`].
+    #[must_use]
+    pub const fn is_leave_request(&self) -> bool {
+        matches!(self, Self::LeaveRequest { .. })
+    }
+
+    /// Returns `true` if this is a [`Content::DeleteMessage`].
+    #[must_use]
+    pub const fn is_delete_message(&self) -> bool {
+        matches!(self, Self::DeleteMessage { .. })
     }
 
     /// Returns `true` if this is a [`Content::Unknown`].
@@ -279,6 +342,59 @@ impl Content {
     pub const fn as_remote_attachment(&self) -> Option<&RemoteAttachment> {
         if let Self::RemoteAttachment(r) = self {
             Some(r)
+        } else {
+            None
+        }
+    }
+
+    /// Returns the attachments if this is a
+    /// [`Content::MultiRemoteAttachment`], or `None`.
+    #[must_use]
+    pub fn as_multi_remote_attachment(&self) -> Option<&[RemoteAttachment]> {
+        if let Self::MultiRemoteAttachment(a) = self {
+            Some(a)
+        } else {
+            None
+        }
+    }
+
+    /// Returns the transaction reference if this is a
+    /// [`Content::TransactionReference`], or `None`.
+    #[must_use]
+    pub const fn as_transaction_reference(&self) -> Option<&TransactionReference> {
+        if let Self::TransactionReference(t) = self {
+            Some(t)
+        } else {
+            None
+        }
+    }
+
+    /// Returns the wallet send-calls if this is a
+    /// [`Content::WalletSendCalls`], or `None`.
+    #[must_use]
+    pub const fn as_wallet_send_calls(&self) -> Option<&WalletSendCalls> {
+        if let Self::WalletSendCalls(w) = self {
+            Some(w)
+        } else {
+            None
+        }
+    }
+
+    /// Returns the actions if this is a [`Content::Actions`], or `None`.
+    #[must_use]
+    pub const fn as_actions(&self) -> Option<&Actions> {
+        if let Self::Actions(a) = self {
+            Some(a)
+        } else {
+            None
+        }
+    }
+
+    /// Returns the intent if this is a [`Content::Intent`], or `None`.
+    #[must_use]
+    pub const fn as_intent(&self) -> Option<&Intent> {
+        if let Self::Intent(i) = self {
+            Some(i)
         } else {
             None
         }
@@ -341,6 +457,202 @@ pub struct RemoteAttachment {
     pub content_length: Option<u32>,
     /// Original filename.
     pub filename: Option<String>,
+}
+
+/// On-chain transaction reference. Wire format is JSON.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct TransactionReference {
+    /// Optional namespace (e.g. `"eip155"`).
+    #[serde(default)]
+    pub namespace: Option<String>,
+    /// Network ID (string or number in JSON).
+    #[serde(rename = "networkId", deserialize_with = "deserialize_network_id")]
+    pub network_id: String,
+    /// Transaction hash.
+    pub reference: String,
+    /// Optional display metadata.
+    #[serde(default)]
+    pub metadata: Option<TransactionMetadata>,
+}
+
+/// Display metadata on a [`TransactionReference`].
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct TransactionMetadata {
+    /// Transaction type (e.g. `"transfer"`).
+    #[serde(rename = "transactionType", default)]
+    pub transaction_type: String,
+    /// Currency symbol.
+    #[serde(default)]
+    pub currency: String,
+    /// Amount in the smallest unit, scaled by `decimals`.
+    #[serde(default)]
+    pub amount: f64,
+    /// Token decimals.
+    #[serde(default)]
+    pub decimals: u32,
+    /// Sender address.
+    #[serde(rename = "fromAddress", default)]
+    pub from_address: String,
+    /// Recipient address.
+    #[serde(rename = "toAddress", default)]
+    pub to_address: String,
+}
+
+fn deserialize_network_id<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer).map_err(serde::de::Error::custom)?;
+    match value {
+        serde_json::Value::String(s) => Ok(s),
+        serde_json::Value::Number(n) => Ok(n.to_string()),
+        _ => Err(serde::de::Error::custom(
+            "networkId must be a string or number",
+        )),
+    }
+}
+
+/// Wallet send-calls payload. Wire format is JSON.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct WalletSendCalls {
+    /// Protocol version (e.g. `"1"`).
+    pub version: String,
+    /// Hex chain ID (e.g. `"0x1"`).
+    #[serde(rename = "chainId")]
+    pub chain_id: String,
+    /// Sender address.
+    pub from: String,
+    /// Calls to submit.
+    pub calls: Vec<WalletCall>,
+    /// Optional wallet capabilities.
+    #[serde(default)]
+    pub capabilities: Option<BTreeMap<String, String>>,
+}
+
+/// One call in a [`WalletSendCalls`] payload.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct WalletCall {
+    /// Destination address.
+    #[serde(default)]
+    pub to: Option<String>,
+    /// Calldata.
+    #[serde(default)]
+    pub data: Option<String>,
+    /// Hex value.
+    #[serde(default)]
+    pub value: Option<String>,
+    /// Hex gas limit.
+    #[serde(default)]
+    pub gas: Option<String>,
+    /// Optional metadata.
+    #[serde(default)]
+    pub metadata: Option<WalletCallMetadata>,
+}
+
+/// Metadata on a [`WalletCall`].
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct WalletCallMetadata {
+    /// Human-readable description.
+    #[serde(default)]
+    pub description: String,
+    /// Transaction type.
+    #[serde(rename = "transactionType", default)]
+    pub transaction_type: String,
+    /// Additional string fields.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, String>,
+}
+
+/// Inline action list. Wire format is JSON (`coinbase.com/actions`).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct Actions {
+    /// Action-list ID.
+    pub id: String,
+    /// Prompt shown to the user.
+    pub description: String,
+    /// Selectable actions.
+    pub actions: Vec<Action>,
+    /// Optional expiry (ISO-8601).
+    #[serde(default, alias = "expires_at", rename = "expiresAt")]
+    pub expires_at: Option<String>,
+}
+
+/// One entry in [`Actions`].
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct Action {
+    /// Action ID.
+    pub id: String,
+    /// Button label.
+    pub label: String,
+    /// Optional image URL.
+    #[serde(default, alias = "image_url", rename = "imageUrl")]
+    pub image_url: Option<String>,
+    /// Optional visual style.
+    #[serde(default)]
+    pub style: Option<ActionStyle>,
+    /// Optional expiry (ISO-8601).
+    #[serde(default, alias = "expires_at", rename = "expiresAt")]
+    pub expires_at: Option<String>,
+}
+
+/// Visual style for an [`Action`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ActionStyle {
+    /// Primary / emphasized.
+    Primary,
+    /// Secondary.
+    Secondary,
+    /// Destructive.
+    Danger,
+}
+
+/// Selected action. Wire format is JSON (`coinbase.com/intent`).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct Intent {
+    /// Intent ID (matches the actions list).
+    pub id: String,
+    /// Selected action ID.
+    #[serde(rename = "actionId", alias = "action_id")]
+    pub action_id: String,
+    /// Optional metadata object.
+    #[serde(default)]
+    pub metadata: Option<BTreeMap<String, serde_json::Value>>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, ProstMessage)]
+struct MultiRemoteAttachmentWire {
+    #[prost(message, repeated, tag = "1")]
+    attachments: Vec<RemoteAttachmentInfo>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, ProstMessage)]
+struct DeleteMessageWire {
+    #[prost(string, tag = "1")]
+    message_id: String,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, ProstMessage)]
+struct LeaveRequestWire {
+    #[prost(bytes = "vec", optional, tag = "1")]
+    authenticated_note: Option<Vec<u8>>,
+}
+
+fn remote_attachment_from_info(info: RemoteAttachmentInfo) -> RemoteAttachment {
+    RemoteAttachment {
+        url: info.url,
+        content_digest: info.content_digest,
+        secret: info.secret,
+        nonce: info.nonce,
+        salt: info.salt,
+        scheme: info.scheme,
+        content_length: info.content_length,
+        filename: info.filename,
+    }
+}
+
+fn decode_json<T: serde::de::DeserializeOwned>(bytes: &[u8], what: &str) -> Result<T> {
+    serde_json::from_slice(bytes).map_err(|e| crate::XmtpError::Ffi(format!("{what} decode: {e}")))
 }
 
 /// Encode a text string into protobuf bytes ready for [`Conversation::send`].
@@ -487,9 +799,9 @@ pub fn decode(raw: &[u8]) -> Result<Content> {
     let ec = EncodedContent::decode(raw)
         .map_err(|e| crate::XmtpError::Ffi(format!("protobuf decode: {e}")))?;
 
-    let type_id = ec.r#type.as_ref().map(|t| t.type_id.as_str());
+    let type_id = ec.r#type.as_ref().map(|t| t.type_id.clone());
 
-    match type_id {
+    match type_id.as_deref() {
         Some("text") => {
             let s = String::from_utf8(ec.content)
                 .map_err(|e| crate::XmtpError::Ffi(format!("invalid UTF-8 text: {e}")))?;
@@ -571,18 +883,59 @@ pub fn decode(raw: &[u8]) -> Result<Content> {
                 content: inner,
             }))
         }
-        _ => {
-            let ct = ec.r#type.as_ref().map_or_else(String::new, |t| {
-                format!(
-                    "{}/{}:{}.{}",
-                    t.authority_id, t.type_id, t.version_major, t.version_minor
-                )
-            });
-            Ok(Content::Unknown {
-                content_type: ct,
-                raw: raw.to_vec(),
+        Some(id) => decode_extra(id, &ec, raw),
+        None => Ok(unknown_content(&ec, raw)),
+    }
+}
+
+fn unknown_content(ec: &EncodedContent, raw: &[u8]) -> Content {
+    let ct = ec.r#type.as_ref().map_or_else(String::new, |t| {
+        format!(
+            "{}/{}:{}.{}",
+            t.authority_id, t.type_id, t.version_major, t.version_minor
+        )
+    });
+    Content::Unknown {
+        content_type: ct,
+        raw: raw.to_vec(),
+    }
+}
+
+fn decode_extra(type_id: &str, ec: &EncodedContent, raw: &[u8]) -> Result<Content> {
+    match type_id {
+        "transactionReference" => {
+            decode_json(&ec.content, "transactionReference").map(Content::TransactionReference)
+        }
+        "walletSendCalls" => {
+            decode_json(&ec.content, "walletSendCalls").map(Content::WalletSendCalls)
+        }
+        "actions" => decode_json(&ec.content, "actions").map(Content::Actions),
+        "intent" => decode_json(&ec.content, "intent").map(Content::Intent),
+        "multiRemoteStaticAttachment" => {
+            let wire = MultiRemoteAttachmentWire::decode(ec.content.as_slice())
+                .map_err(|e| crate::XmtpError::Ffi(format!("multiRemoteAttachment decode: {e}")))?;
+            Ok(Content::MultiRemoteAttachment(
+                wire.attachments
+                    .into_iter()
+                    .map(remote_attachment_from_info)
+                    .collect(),
+            ))
+        }
+        "leave_request" => {
+            let wire = LeaveRequestWire::decode(ec.content.as_slice())
+                .map_err(|e| crate::XmtpError::Ffi(format!("leave_request decode: {e}")))?;
+            Ok(Content::LeaveRequest {
+                authenticated_note: wire.authenticated_note,
             })
         }
+        "deleteMessage" => {
+            let wire = DeleteMessageWire::decode(ec.content.as_slice())
+                .map_err(|e| crate::XmtpError::Ffi(format!("deleteMessage decode: {e}")))?;
+            Ok(Content::DeleteMessage {
+                message_id: wire.message_id,
+            })
+        }
+        _ => Ok(unknown_content(ec, raw)),
     }
 }
 
@@ -676,5 +1029,146 @@ impl Conversation {
     /// Optimistically send a text reply.
     pub fn send_text_reply_optimistic(&self, reference_id: &str, text: &str) -> Result<String> {
         self.send_optimistic(&encode_text_reply(reference_id, text))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn envelope(type_id: &str, content: Vec<u8>) -> Vec<u8> {
+        EncodedContent {
+            r#type: Some(ContentTypeId {
+                authority_id: "xmtp.org".into(),
+                type_id: type_id.into(),
+                version_major: 1,
+                version_minor: 0,
+            }),
+            parameters: BTreeMap::new(),
+            fallback: None,
+            content,
+            compression: None,
+        }
+        .encode_to_vec()
+    }
+
+    #[test]
+    fn decode_text_still_works() {
+        let raw = encode_text("hello");
+        assert!(matches!(decode(&raw).unwrap(), Content::Text(s) if s == "hello"));
+    }
+
+    #[test]
+    fn decode_transaction_reference_json_numeric_network_id() {
+        let json = br#"{"namespace":"eip155","networkId":1,"reference":"0xabc","metadata":{"transactionType":"transfer","currency":"USDC","amount":100000,"decimals":6,"fromAddress":"0xfrom","toAddress":"0xto"}}"#;
+        let raw = envelope("transactionReference", json.to_vec());
+        let tx = decode(&raw)
+            .unwrap()
+            .as_transaction_reference()
+            .expect("TransactionReference")
+            .clone();
+        assert_eq!(tx.namespace.as_deref(), Some("eip155"));
+        assert_eq!(tx.network_id, "1");
+        assert_eq!(tx.reference, "0xabc");
+        let meta = tx.metadata.expect("metadata");
+        assert_eq!(meta.currency, "USDC");
+        assert_eq!(meta.decimals, 6);
+    }
+
+    #[test]
+    fn decode_wallet_send_calls_json() {
+        let json = br#"{"version":"1","chainId":"0x1","from":"0xsender","calls":[{"to":"0xto","data":"0xdead","value":"0x0"}]}"#;
+        let raw = envelope("walletSendCalls", json.to_vec());
+        let w = decode(&raw)
+            .unwrap()
+            .as_wallet_send_calls()
+            .expect("WalletSendCalls")
+            .clone();
+        assert_eq!(w.chain_id, "0x1");
+        assert_eq!(w.calls.len(), 1);
+        assert_eq!(w.calls.first().and_then(|c| c.to.as_deref()), Some("0xto"));
+    }
+
+    #[test]
+    fn decode_actions_and_intent_json() {
+        let actions = br#"{"id":"list","description":"pick","actions":[{"id":"a1","label":"One","style":"primary"}]}"#;
+        let raw = envelope("actions", actions.to_vec());
+        let a = decode(&raw).unwrap().as_actions().expect("Actions").clone();
+        assert_eq!(a.id, "list");
+        assert_eq!(
+            a.actions.first().and_then(|x| x.style),
+            Some(ActionStyle::Primary)
+        );
+
+        let intent = br#"{"id":"list","actionId":"a1","metadata":{"k":true}}"#;
+        let intent_raw = envelope("intent", intent.to_vec());
+        let i = decode(&intent_raw)
+            .unwrap()
+            .as_intent()
+            .expect("Intent")
+            .clone();
+        assert_eq!(i.action_id, "a1");
+        assert_eq!(i.metadata.as_ref().map(BTreeMap::len), Some(1));
+    }
+
+    #[test]
+    fn decode_delete_message_and_leave_request_proto() {
+        let raw = envelope(
+            "deleteMessage",
+            DeleteMessageWire {
+                message_id: "mid".into(),
+            }
+            .encode_to_vec(),
+        );
+        match decode(&raw).unwrap() {
+            Content::DeleteMessage { message_id } => assert_eq!(message_id, "mid"),
+            other => unreachable!("expected DeleteMessage, got {other:?}"),
+        }
+
+        let leave_raw = envelope(
+            "leave_request",
+            LeaveRequestWire {
+                authenticated_note: Some(vec![1, 2, 3]),
+            }
+            .encode_to_vec(),
+        );
+        match decode(&leave_raw).unwrap() {
+            Content::LeaveRequest { authenticated_note } => {
+                assert_eq!(authenticated_note.as_deref(), Some([1, 2, 3].as_slice()));
+            }
+            other => unreachable!("expected LeaveRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_multi_remote_attachment_proto() {
+        let wire = MultiRemoteAttachmentWire {
+            attachments: vec![RemoteAttachmentInfo {
+                content_digest: "ab".into(),
+                secret: vec![0; 32],
+                nonce: vec![0; 16],
+                salt: vec![0; 16],
+                scheme: "https".into(),
+                url: "https://example.test/a".into(),
+                content_length: Some(4),
+                filename: Some("a.bin".into()),
+            }],
+        };
+        let raw = envelope("multiRemoteStaticAttachment", wire.encode_to_vec());
+        match decode(&raw).unwrap() {
+            Content::MultiRemoteAttachment(atts) => {
+                assert_eq!(atts.len(), 1);
+                let att = atts.first().expect("attachment");
+                assert_eq!(att.filename.as_deref(), Some("a.bin"));
+                assert_eq!(att.url, "https://example.test/a");
+            }
+            other => unreachable!("expected MultiRemoteAttachment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extra_types_are_decode_only_unknown_on_send_path() {
+        let raw = envelope("notARealType", b"{}".to_vec());
+        assert!(decode(&raw).unwrap().is_unknown());
     }
 }

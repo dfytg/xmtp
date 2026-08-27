@@ -5631,7 +5631,7 @@ dependencies = [
 
 [[package]]
 name = "xmtp"
-version = "0.9.3"
+version = "0.10.0"
 dependencies = [
  "alloy-ens",
  "alloy-primitives",
@@ -5641,6 +5641,8 @@ dependencies = [
  "alloy-signer-local",
  "hex",
  "prost",
+ "serde",
+ "serde_json",
  "thiserror 2.0.20",
  "tokio",
  "url",
@@ -5649,7 +5651,7 @@ dependencies = [
 
 [[package]]
 name = "xmtp-cli"
-version = "0.9.3"
+version = "0.10.0"
 dependencies = [
  "clap",
  "dirs",
@@ -5664,10 +5666,11 @@ dependencies = [
 
 [[package]]
 name = "xmtp-sys"
-version = "0.1.11"
+version = "0.2.0"
 dependencies = [
  "bindgen",
  "flate2",
+ "sha2",
  "tar",
  "ureq",
  "zip",

@@ -24,9 +24,10 @@ use crate::types::{ConsentEntityType, ConsentState, ConversationType, Preference
 /// [`try_recv`](Self::try_recv), or [`Iterator`] consumption.
 /// The underlying FFI stream is stopped when this value is dropped.
 pub struct Subscription<T> {
+    // Declared first so it is dropped last (after the stream handle).
+    _ctx: Option<Box<dyn std::any::Any + Send>>,
     rx: mpsc::Receiver<T>,
     handle: OwnedHandle<xmtp_sys::XmtpFfiStreamHandle>,
-    _ctx: Option<Box<dyn std::any::Any + Send>>,
 }
 
 impl<T> Subscription<T> {
@@ -65,9 +66,19 @@ impl<T> Iterator for Subscription<T> {
 
 impl<T> Drop for Subscription<T> {
     fn drop(&mut self) {
-        // Signal the FFI stream to stop before OwnedHandle frees the resource.
         // SAFETY: `self.handle` is a valid stream handle; safe to call multiple times.
         unsafe { xmtp_sys::xmtp_stream_end(self.handle.as_ptr()) };
+        // SAFETY: join takes the task via `*mut`; handle is still freed on field drop.
+        let join_rc = unsafe { xmtp_sys::xmtp_stream_join(self.handle.as_mut_ptr()) };
+        if join_rc != 0 {
+            #[allow(
+                clippy::used_underscore_binding,
+                reason = "field is owned for lifetime; take on timeout to leak"
+            )]
+            if let Some(ctx) = self._ctx.take() {
+                let _leaked = std::mem::ManuallyDrop::new(ctx);
+            }
+        }
     }
 }
 
@@ -132,9 +143,9 @@ fn subscribe<T: Send + 'static, F: Send + 'static>(
     // SAFETY: `ctx_ptr` was created via `Box::into_raw` and the FFI layer no longer owns it.
     let ctx_box = unsafe { Box::from_raw(ctx_ptr.cast::<F>()) };
     Ok(Subscription {
+        _ctx: Some(ctx_box),
         rx,
         handle,
-        _ctx: Some(ctx_box),
     })
 }
 

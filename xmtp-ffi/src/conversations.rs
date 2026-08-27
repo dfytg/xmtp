@@ -80,11 +80,11 @@ pub unsafe extern "C" fn xmtp_client_create_group(
         let (policy_set, metadata) = unsafe { parse_group_opts(opts)? };
         let group = c.inner.create_group(policy_set, metadata)?;
 
-        if !member_inbox_ids.is_null() && member_count > 0 {
+        if member_inbox_ids.is_null() || member_count == 0 {
+            group.sync().await?;
+        } else {
             let ids = unsafe { collect_strings(member_inbox_ids, member_count)? };
             group.add_members(&ids).await?;
-        } else {
-            group.sync().await?;
         }
 
         unsafe { write_out(out, FfiConversation { inner: group })? };
@@ -113,11 +113,11 @@ pub unsafe extern "C" fn xmtp_client_create_group_by_identity(
         let (policy_set, metadata) = unsafe { parse_group_opts(opts)? };
         let group = c.inner.create_group(policy_set, metadata)?;
 
-        if !identifiers.is_null() && count > 0 {
+        if identifiers.is_null() || count == 0 {
+            group.sync().await?;
+        } else {
             let idents = unsafe { collect_identifiers(identifiers, kinds, count)? };
             group.add_members_by_identity(&idents).await?;
-        } else {
-            group.sync().await?;
         }
 
         unsafe { write_out(out, FfiConversation { inner: group })? };
@@ -228,7 +228,7 @@ pub unsafe extern "C" fn xmtp_client_get_conversation_by_id(
             return Err("null output pointer".into());
         }
         let id_str = unsafe { c_str_to_string(hex_id)? };
-        let group_id = hex::decode(&id_str)?;
+        let group_id = xmtp_proto::types::GroupId::try_from(hex::decode(&id_str)?)?;
         let group = c.inner.stitched_group(&group_id)?;
         unsafe { write_out(out, FfiConversation { inner: group })? };
         Ok(())
@@ -256,7 +256,7 @@ pub unsafe extern "C" fn xmtp_client_list_conversations(
             GroupQueryArgs::default()
         } else {
             let o = unsafe { &*opts };
-            let consent = parse_consent_states(o.consent_states, o.consent_states_count);
+            let consent = parse_consent_states(o.consent_states, o.consent_states_count)?;
             GroupQueryArgs {
                 conversation_type: match o.conversation_type {
                     0 => Some(xmtp_db::group::ConversationType::Dm),
@@ -429,7 +429,7 @@ pub unsafe extern "C" fn xmtp_client_sync_all(
 ) -> i32 {
     catch_async(|| async {
         let c = unsafe { ref_from(client)? };
-        let consents = parse_consent_states(consent_states, consent_states_count);
+        let consents = parse_consent_states(consent_states, consent_states_count)?;
         let summary = c.inner.sync_all_welcomes_and_groups(consents).await?;
         if !out_synced.is_null() {
             unsafe {
@@ -490,9 +490,9 @@ pub unsafe extern "C" fn xmtp_client_hmac_keys(
         for conv in conversations {
             if let Ok(keys) = conv.hmac_keys(-1..=1) {
                 entries.push(crate::conversation::hmac_keys_to_entry(
-                    &conv.group_id,
+                    conv.group_id.as_slice(),
                     keys,
-                ));
+                )?);
             }
         }
 
@@ -519,9 +519,7 @@ pub unsafe extern "C" fn xmtp_client_process_streamed_welcome_message(
         if out.is_null() {
             return Err("null output pointer".into());
         }
-        let bytes =
-            unsafe { std::slice::from_raw_parts(envelope_bytes, envelope_bytes_len as usize) }
-                .to_vec();
+        let bytes = checked_slice_nonempty(envelope_bytes, envelope_bytes_len)?.to_vec();
         let groups = c.inner.process_streamed_welcome_message(bytes).await?;
         let items: Vec<FfiConversationListItemInner> = groups
             .into_iter()
@@ -557,7 +555,8 @@ pub unsafe extern "C" fn xmtp_client_get_enriched_message_by_id(
         let id_bytes = hex::decode(&id_str)?;
         let raw_msg = c.inner.message(id_bytes.clone())?;
         let msg = c.inner.message_v2(id_bytes)?;
-        let item = crate::conversation::decoded_to_enriched(&msg, &raw_msg.decrypted_message_bytes);
+        let item =
+            crate::conversation::decoded_to_enriched(&msg, &raw_msg.decrypted_message_bytes)?;
         unsafe { write_out(out, FfiEnrichedMessageList { items: vec![item] })? };
         Ok(())
     })

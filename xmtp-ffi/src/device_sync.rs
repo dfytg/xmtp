@@ -3,7 +3,6 @@
 use std::ffi::c_char;
 
 use xmtp_archive::{
-    ENC_KEY_SIZE,
     archive_options::{ArchiveOptions as NativeArchiveOptions, BackupElementSelection},
     exporter::ArchiveExporter,
     importer::ArchiveImporter,
@@ -41,14 +40,9 @@ fn parse_archive_opts(opts: *const FfiArchiveOptions) -> NativeArchiveOptions {
     }
 }
 
-/// Validate and truncate an encryption key to `ENC_KEY_SIZE`.
+/// Validate a 32-byte encryption key.
 fn check_key(key: *const u8, key_len: i32) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    if key.is_null() || (key_len as usize) < ENC_KEY_SIZE {
-        return Err(format!("encryption key must be at least {} bytes", ENC_KEY_SIZE).into());
-    }
-    let mut v = unsafe { std::slice::from_raw_parts(key, key_len as usize) }.to_vec();
-    v.truncate(ENC_KEY_SIZE);
-    Ok(v)
+    Ok(checked_key32(key, key_len)?.to_vec())
 }
 
 // ---------------------------------------------------------------------------
@@ -146,20 +140,23 @@ pub unsafe extern "C" fn xmtp_device_sync_list_available_archives(
         let items: Vec<FfiAvailableArchive> = archives
             .into_iter()
             .map(|a| {
+                let pin = to_cstring(&a.pin)?;
                 let inst = a.sent_by_installation;
                 let inst_len = inst.len() as i32;
-                // Use into_boxed_slice to guarantee cap == len for safe deallocation
-                let inst_boxed = inst.into_boxed_slice();
-                let inst_ptr = Box::into_raw(inst_boxed) as *mut u8;
-                FfiAvailableArchive {
-                    pin: to_c_string(&a.pin),
+                let inst_ptr = if inst.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    Box::into_raw(inst.into_boxed_slice()) as *mut u8
+                };
+                Ok(FfiAvailableArchive {
+                    pin: pin.into_raw(),
                     backup_version: a.metadata.backup_version,
                     exported_at_ns: a.metadata.exported_at_ns,
                     sent_by_installation: inst_ptr,
                     sent_by_installation_len: inst_len,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<_, Box<dyn std::error::Error>>>()?;
         unsafe { write_out(out, FfiAvailableArchiveList { items })? };
         Ok(())
     })
@@ -199,21 +196,8 @@ pub unsafe extern "C" fn xmtp_available_archive_exported_at_ns(
 /// Free an available archive list.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xmtp_available_archive_list_free(list: *mut FfiAvailableArchiveList) {
-    if list.is_null() {
-        return;
-    }
-    let l = unsafe { Box::from_raw(list) };
-    for item in &l.items {
-        free_c_strings!(item, pin);
-        if !item.sent_by_installation.is_null() && item.sent_by_installation_len > 0 {
-            drop(unsafe {
-                Vec::from_raw_parts(
-                    item.sent_by_installation,
-                    item.sent_by_installation_len as usize,
-                    item.sent_by_installation_len as usize,
-                )
-            });
-        }
+    if !list.is_null() {
+        drop(unsafe { Box::from_raw(list) });
     }
 }
 
@@ -222,7 +206,7 @@ pub unsafe extern "C" fn xmtp_available_archive_list_free(list: *mut FfiAvailabl
 // ---------------------------------------------------------------------------
 
 /// Export an archive to a local file.
-/// `key` must be at least 32 bytes (encryption key).
+/// `key` must be exactly 32 bytes (encryption key).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xmtp_device_sync_create_archive(
     client: *const FfiClient,
@@ -247,7 +231,7 @@ pub unsafe extern "C" fn xmtp_device_sync_create_archive(
 // ---------------------------------------------------------------------------
 
 /// Import a previously exported archive from a file.
-/// `key` must be at least 32 bytes (encryption key).
+/// `key` must be exactly 32 bytes (encryption key).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xmtp_device_sync_import_archive(
     client: *const FfiClient,

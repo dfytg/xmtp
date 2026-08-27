@@ -10,12 +10,28 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use xmtp::Env;
 
+fn cli_version() -> &'static str {
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION
+        .get_or_init(|| {
+            let pkg = env!("CARGO_PKG_VERSION");
+            xmtp::libxmtp_version()
+                .map_or_else(|_| pkg.to_owned(), |lib| format!("{pkg} (libxmtp {lib})"))
+        })
+        .as_str()
+}
+
 /// Interactive XMTP TUI chat client.
 ///
 /// Launch without a subcommand to enter the TUI chat interface.
 /// Use subcommands for one-shot operations.
 #[derive(Parser)]
-#[command(name = "xmtp", version, about, args_conflicts_with_subcommands = true)]
+#[command(
+    name = "xmtp",
+    version = cli_version(),
+    about,
+    args_conflicts_with_subcommands = true
+)]
 pub(crate) struct Cli {
     /// Profile name for TUI session (uses default if omitted).
     pub profile: Option<String>,
@@ -180,6 +196,112 @@ pub(crate) enum Command {
         #[arg(long)]
         profile: Option<String>,
     },
+    /// Request history transfer from another installation.
+    Sync {
+        /// Override history-sync server URL (defaults from the profile env).
+        #[arg(long)]
+        history_url: Option<String>,
+        /// Profile name (uses default if omitted).
+        #[arg(long)]
+        profile: Option<String>,
+        #[command(flatten)]
+        output: OutputArgs,
+    },
+    /// Device-sync archive operations.
+    #[command(subcommand)]
+    Archive(ArchiveCommand),
+}
+
+/// Subcommands for `xmtp archive`.
+#[derive(Subcommand)]
+pub(crate) enum ArchiveCommand {
+    /// Export an encrypted archive to a local file.
+    Create {
+        /// Destination file path.
+        path: PathBuf,
+        /// 32-byte archive key as hex. Defaults to the profile `db.key`.
+        #[arg(long)]
+        key: Option<String>,
+        /// Profile name (uses default if omitted).
+        #[arg(long)]
+        profile: Option<String>,
+        #[command(flatten)]
+        output: OutputArgs,
+    },
+    /// Import an encrypted archive from a local file.
+    Import {
+        /// Source file path.
+        path: PathBuf,
+        /// 32-byte archive key as hex. Defaults to the profile `db.key`.
+        #[arg(long)]
+        key: Option<String>,
+        /// Profile name (uses default if omitted).
+        #[arg(long)]
+        profile: Option<String>,
+        #[command(flatten)]
+        output: OutputArgs,
+    },
+    /// Read metadata from an archive file.
+    Metadata {
+        /// Archive file path.
+        path: PathBuf,
+        /// 32-byte archive key as hex. Defaults to the profile `db.key`.
+        #[arg(long)]
+        key: Option<String>,
+        /// Profile name (uses default if omitted).
+        #[arg(long)]
+        profile: Option<String>,
+        #[command(flatten)]
+        output: OutputArgs,
+    },
+    /// List archives available in the device-sync group.
+    List {
+        /// How many days back to look.
+        #[arg(long, default_value_t = 7)]
+        days: u32,
+        /// Profile name (uses default if omitted).
+        #[arg(long)]
+        profile: Option<String>,
+        #[command(flatten)]
+        output: OutputArgs,
+    },
+    /// Process a sync archive (`--pin` omitted = latest).
+    Process {
+        /// Pin identifying the archive. Omit to process the latest.
+        #[arg(long)]
+        pin: Option<String>,
+        /// Profile name (uses default if omitted).
+        #[arg(long)]
+        profile: Option<String>,
+        #[command(flatten)]
+        output: OutputArgs,
+    },
+    /// Upload a sync archive for the given pin.
+    Send {
+        /// Pin identifying the archive to upload.
+        pin: String,
+        /// Override history-sync server URL (defaults from the profile env).
+        #[arg(long)]
+        history_url: Option<String>,
+        /// Profile name (uses default if omitted).
+        #[arg(long)]
+        profile: Option<String>,
+        #[command(flatten)]
+        output: OutputArgs,
+    },
+}
+
+impl ArchiveCommand {
+    const fn is_json(&self) -> bool {
+        match self {
+            Self::Create { output, .. }
+            | Self::Import { output, .. }
+            | Self::Metadata { output, .. }
+            | Self::List { output, .. }
+            | Self::Process { output, .. }
+            | Self::Send { output, .. } => output.json,
+        }
+    }
 }
 
 impl Command {
@@ -196,7 +318,9 @@ impl Command {
             | Self::CreateGroup { output, .. }
             | Self::Members { output, .. }
             | Self::CanMessage { output, .. }
-            | Self::Request { output, .. } => output.json,
+            | Self::Request { output, .. }
+            | Self::Sync { output, .. } => output.json,
+            Self::Archive(cmd) => cmd.is_json(),
             Self::Stream { .. } => true,
             Self::New(_) | Self::Remove { .. } | Self::Clear | Self::Revoke { .. } => false,
         }
@@ -224,10 +348,6 @@ pub(crate) struct NewArgs {
     /// Copy a private key file into the profile.
     #[arg(long, conflicts_with_all = ["import", "ledger"])]
     pub key: Option<PathBuf>,
-
-    /// Copy a database file into the profile.
-    #[arg(long)]
-    pub db: Option<PathBuf>,
 
     /// Use a Ledger hardware wallet (optionally specify account index, default 0).
     #[arg(long, num_args = 0..=1, default_missing_value = "0",

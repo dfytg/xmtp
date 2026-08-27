@@ -1,6 +1,6 @@
 [package]
 name = "xmtp-sys"
-version = "0.1.11"
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -10,7 +10,7 @@ links = "xmtp_ffi"
 documentation = "https://docs.rs/xmtp-sys"
 categories = ["api-bindings", "cryptography", "network-programming"]
 keywords = ["xmtp", "ffi", "messaging", "e2e-encryption", "mls"]
-rust-version = "1.85"
+rust-version = "1.94"
 
 [features]
 ## Re-generate bindings from the C header at build time (requires libclang).
@@ -21,6 +21,7 @@ regenerate = ["dep:bindgen"]
 bindgen = { workspace = true, optional = true }
 ureq.workspace = true
 flate2.workspace = true
+sha2.workspace = true
 tar.workspace = true
 zip.workspace = true
 

@@ -32,6 +32,12 @@ impl<T> OwnedHandle<T> {
     pub(crate) const fn as_ptr(&self) -> *const T {
         self.ptr.as_ptr().cast_const()
     }
+
+    /// Mutable pointer for FFI calls that take ownership of interior state (`join`).
+    #[inline]
+    pub(crate) const fn as_mut_ptr(&self) -> *mut T {
+        self.ptr.as_ptr()
+    }
 }
 
 impl<T> Drop for OwnedHandle<T> {

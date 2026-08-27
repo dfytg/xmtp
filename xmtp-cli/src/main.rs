@@ -29,6 +29,13 @@ use crate::cmd::config;
 use crate::cmd::{Cli, Command};
 use crate::event::{Cmd as WorkerCmd, Event};
 
+fn init_cli_logger() {
+    match std::env::var("RUST_LOG") {
+        Ok(level) if !level.is_empty() => drop(xmtp::init_logger(Some(&level))),
+        _ => {}
+    }
+}
+
 fn main() {
     let Ok(rt) = tokio::runtime::Runtime::new() else {
         eprintln!("fatal: failed to create tokio runtime");
@@ -37,6 +44,7 @@ fn main() {
     let _guard = rt.enter();
 
     let cli = Cli::parse();
+    init_cli_logger();
     let json_mode = cli.command.as_ref().is_some_and(Command::is_json);
 
     if let Err(e) = run(cli) {
@@ -65,19 +73,11 @@ fn run(cli: Cli) -> xmtp::Result<()> {
             rpc_url: xmtp::DEFAULT_RPC.into(),
             import: None,
             key: None,
-            db: None,
             ledger: None,
         })?;
     }
 
-    let mut cfg = config::ProfileConfig::load(&name)?;
-
-    if cfg.address.is_empty() {
-        eprintln!("  Migrating profile '{name}'");
-        let (migrated, _) = config::open_client(&name)?;
-        cfg = migrated;
-    }
-
+    let cfg = config::ProfileConfig::load(&name)?;
     run_tui(&name, &cfg)
 }
 
@@ -159,6 +159,16 @@ fn dispatch(command: &Command) -> xmtp::Result<()> {
         Command::Stream { kind, profile } => {
             cmd::agent::stream_events(&resolve_profile(profile.clone()), kind)
         }
+        Command::Sync {
+            history_url,
+            profile,
+            output,
+        } => cmd::agent::sync(
+            &resolve_profile(profile.clone()),
+            history_url.as_deref(),
+            output.json,
+        ),
+        Command::Archive(cmd) => cmd::agent::archive(cmd),
     }
 }
 

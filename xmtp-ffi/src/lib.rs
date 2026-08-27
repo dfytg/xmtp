@@ -15,6 +15,7 @@
 //! - `*mut` output pointers must be writable.
 //! - Opaque handles must originate from this crate and must not be used after being freed.
 #![allow(clippy::missing_safety_doc)]
+#![recursion_limit = "256"] // nightly overflows 128 on libxmtp v1.11 async layouts
 
 mod ffi;
 

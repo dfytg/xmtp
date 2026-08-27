@@ -12,7 +12,18 @@ All types and functions are **auto-generated** by [`bindgen`](https://docs.rs/bi
 At build time, the build script:
 
 1. Downloads the pre-built static library from [GitHub Releases](https://github.com/qntx/xmtp/releases) for the current target platform (or uses a local path via `XMTP_FFI_DIR`).
-2. Configures the linker to link the static library plus required system dependencies.
+2. When `sha256sums/{version}` exists, hashes the downloaded archive and fails the build on a missing or mismatched digest for the current target asset.
+3. Extracts only `libxmtp_ffi.a` / `xmtp_ffi.lib` / `xmtp_ffi.h`, rejecting `..` and absolute paths.
+4. Configures the linker to link the static library plus required system dependencies.
+
+## FFI artifact integrity
+
+Committed files under [`sha256sums/`](sha256sums/) use GNU `sha256sum` format (64 hex digits, two spaces, GitHub Release asset filename). `build.rs` looks up `sha256sums/{CARGO_PKG_VERSION}` (or `XMTP_FFI_VERSION` when set).
+
+- **No file for this version** (including `0.2.0` until SHA256SUMS are harvested from `ffi-build.yml`): skip verification and emit `cargo:warning`.
+- **File present:** fail the build if the current target asset is missing from the map or the digest does not match. Incremental rebuilds reuse `OUT_DIR/lib` only when `archive.sha256` matches that digest.
+- **`XMTP_FFI_DIR`:** skips download and checksums (local staticlib).
+- There is no checksum-skip environment variable for download builds.
 
 ## Environment variables
 
@@ -38,6 +49,8 @@ At build time, the build script:
 | `x86_64-pc-windows-msvc` | ✅ |
 | `aarch64-pc-windows-msvc` | ✅ |
 
+Intel macOS (`x86_64-apple-darwin`) is unsupported.
+
 ## License
 
-Licensed under the MIT license.
+Licensed under either of [Apache License, Version 2.0](../LICENSE-APACHE) or [MIT License](../LICENSE-MIT) at your option.

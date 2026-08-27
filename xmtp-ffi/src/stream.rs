@@ -7,18 +7,22 @@
 //!
 //! # Lifecycle
 //! `xmtp_stream_end(handle)` → signal stop.
-//! `xmtp_stream_is_closed(handle)` → poll status.
-//! `xmtp_stream_free(handle)` → release handle memory.
+//! `xmtp_stream_join(handle)` → wait for the worker (timeout leaks the task).
+//! `xmtp_stream_free(handle)` → release handle memory; does not wait.
 
 use std::ffi::{c_char, c_void};
+use std::mem::ManuallyDrop;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use xmtp_common::StreamHandle;
 use xmtp_mls::Client as MlsClient;
 use xmtp_mls::groups::MlsGroup;
 
 use crate::ffi::*;
+
+const JOIN_TIMEOUT: Duration = Duration::from_millis(if cfg!(test) { 200 } else { 5_000 });
 
 /// Nullable on-close callback passed to stream functions.
 ///
@@ -47,8 +51,30 @@ fn parse_conv_type(v: i32) -> Option<xmtp_db::group::ConversationType> {
         0 => Some(xmtp_db::group::ConversationType::Dm),
         1 => Some(xmtp_db::group::ConversationType::Group),
         2 => Some(xmtp_db::group::ConversationType::Sync),
+        3 => Some(xmtp_db::group::ConversationType::Oneshot),
         _ => None,
     }
+}
+
+fn take_join_task(h: &FfiStreamHandle) -> Option<FfiJoinHandle> {
+    h.join
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+}
+
+fn leak_join_task(task: FfiJoinHandle) {
+    let _leaked = ManuallyDrop::new(task);
+}
+
+/// `true` if the wait hit `JOIN_TIMEOUT`.
+fn stream_join_timed_out(task: &mut FfiJoinHandle) -> bool {
+    let fut = async { tokio::time::timeout(JOIN_TIMEOUT, task.end_and_wait()).await };
+    let result = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
+        Err(_) => runtime().block_on(fut),
+    };
+    result.is_err()
 }
 
 /// Guard ensuring `on_close` is called at most once across data-error and close paths.
@@ -72,12 +98,7 @@ fn invoke_on_close_ok(on_close: OnCloseCb, ctx: usize, guard: &OnCloseGuard) {
 
 /// Invoke the on_close callback with an error message.
 /// No-op if already called.
-fn invoke_on_close_err(
-    on_close: OnCloseCb,
-    ctx: usize,
-    err: &str,
-    guard: &OnCloseGuard,
-) {
+fn invoke_on_close_err(on_close: OnCloseCb, ctx: usize, err: &str, guard: &OnCloseGuard) {
     if guard.swap(true, Ordering::AcqRel) {
         return; // already fired
     }
@@ -87,11 +108,16 @@ fn invoke_on_close_err(
     }
 }
 
-/// Finalize a stream handle: wait_for_ready, extract abort handle, write to output.
-fn finalize_stream(
-    handle: &mut impl StreamHandle,
+/// Finalize a stream handle: wait_for_ready, keep the joinable task, write to output.
+fn finalize_stream<H>(
+    mut handle: H,
     out: *mut *mut FfiStreamHandle,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    H: StreamHandle<StreamOutput = Result<(), xmtp_mls::subscriptions::SubscribeError>>
+        + Send
+        + 'static,
+{
     runtime().block_on(handle.wait_for_ready());
     let abort = handle.abort_handle();
     unsafe {
@@ -99,6 +125,7 @@ fn finalize_stream(
             out,
             FfiStreamHandle {
                 abort: Arc::new(abort),
+                join: std::sync::Mutex::new(Some(Box::new(handle))),
             },
         )
     }
@@ -110,7 +137,7 @@ fn finalize_stream(
 
 /// Stream new conversations. Callback receives owned `*mut FfiConversation` (caller must free).
 /// `on_close(error, ctx)`: null error = normal close; non-null = borrowed error string.
-/// Caller must end with `xmtp_stream_end` and free with `xmtp_stream_free`.
+/// Caller must `xmtp_stream_end`, `xmtp_stream_join`, then `xmtp_stream_free`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xmtp_stream_conversations(
     client: *const FfiClient,
@@ -132,7 +159,7 @@ pub unsafe extern "C" fn xmtp_stream_conversations(
         let g1 = guard.clone();
         let g2 = guard;
 
-        let mut handle = MlsClient::stream_conversations_with_callback(
+        let handle = MlsClient::stream_conversations_with_callback(
             c.inner.clone(),
             conv_type,
             move |result| match result {
@@ -145,7 +172,7 @@ pub unsafe extern "C" fn xmtp_stream_conversations(
             move || invoke_on_close_ok(on_close, ctx, &g2),
             false,
         );
-        finalize_stream(&mut handle, out)
+        finalize_stream(handle, out)
     })
 }
 
@@ -173,13 +200,13 @@ pub unsafe extern "C" fn xmtp_stream_all_messages(
             return Err("null output pointer".into());
         }
         let conv_type = parse_conv_type(conversation_type);
-        let consents = parse_consent_states(consent_states, consent_states_count);
+        let consents = parse_consent_states(consent_states, consent_states_count)?;
         let ctx = context as usize;
         let guard = new_on_close_guard();
         let g1 = guard.clone();
         let g2 = guard;
 
-        let mut handle = MlsClient::stream_all_messages_with_callback(
+        let handle = MlsClient::stream_all_messages_with_callback(
             c.inner.context.clone(),
             conv_type,
             consents,
@@ -192,7 +219,7 @@ pub unsafe extern "C" fn xmtp_stream_all_messages(
             },
             move || invoke_on_close_ok(on_close, ctx, &g2),
         );
-        finalize_stream(&mut handle, out)
+        finalize_stream(handle, out)
     })
 }
 
@@ -220,7 +247,7 @@ pub unsafe extern "C" fn xmtp_conversation_stream_messages(
         let g1 = guard.clone();
         let g2 = guard;
 
-        let mut handle = MlsGroup::stream_with_callback(
+        let handle = MlsGroup::stream_with_callback(
             c.inner.context.clone(),
             c.inner.group_id.clone(),
             move |result| match result {
@@ -232,7 +259,7 @@ pub unsafe extern "C" fn xmtp_conversation_stream_messages(
             },
             move || invoke_on_close_ok(on_close, ctx, &g2),
         );
-        finalize_stream(&mut handle, out)
+        finalize_stream(handle, out)
     })
 }
 
@@ -262,7 +289,7 @@ pub unsafe extern "C" fn xmtp_stream_consent(
         let g1 = guard.clone();
         let g2 = guard;
 
-        let mut handle = MlsClient::stream_consent_with_callback(
+        let handle = MlsClient::stream_consent_with_callback(
             c.inner.clone(),
             move |result| match result {
                 Ok(records) => {
@@ -286,7 +313,7 @@ pub unsafe extern "C" fn xmtp_stream_consent(
             },
             move || invoke_on_close_ok(on_close, ctx, &g2),
         );
-        finalize_stream(&mut handle, out)
+        finalize_stream(handle, out)
     })
 }
 
@@ -316,7 +343,7 @@ pub unsafe extern "C" fn xmtp_stream_preferences(
         let g1 = guard.clone();
         let g2 = guard;
 
-        let mut handle = MlsClient::stream_preferences_with_callback(
+        let handle = MlsClient::stream_preferences_with_callback(
             c.inner.clone(),
             move |result| match result {
                 Ok(updates) => {
@@ -373,7 +400,7 @@ pub unsafe extern "C" fn xmtp_stream_preferences(
             },
             move || invoke_on_close_ok(on_close, ctx, &g2),
         );
-        finalize_stream(&mut handle, out)
+        finalize_stream(handle, out)
     })
 }
 
@@ -383,7 +410,6 @@ pub unsafe extern "C" fn xmtp_stream_preferences(
 
 /// Stream message deletion events. Callback receives a borrowed hex message ID
 /// (`*const c_char`) — valid only during the callback invocation.
-/// Now includes `on_close` for API consistency with other stream functions.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xmtp_stream_message_deletions(
     client: *const FfiClient,
@@ -404,37 +430,19 @@ pub unsafe extern "C" fn xmtp_stream_message_deletions(
         let g1 = guard.clone();
         let g2 = guard;
 
-        let mut handle =
-            MlsClient::stream_message_deletions_with_callback(c.inner.clone(), move |result| {
-                match result {
-                    Ok(decoded) => {
-                        let id_hex = hex::encode(&decoded.metadata.id);
-                        let c_str = std::ffi::CString::new(id_hex).unwrap_or_default();
-                        unsafe { callback(c_str.as_ptr(), ctx as *mut c_void) };
-                    }
-                    Err(e) => invoke_on_close_err(on_close, ctx, &e.to_string(), &g1),
+        let handle = MlsClient::stream_message_deletions_with_callback(
+            c.inner.clone(),
+            move |result| match result {
+                Ok(decoded) => {
+                    let id_hex = hex::encode(&decoded.metadata.id);
+                    let c_str = std::ffi::CString::new(id_hex).unwrap_or_default();
+                    unsafe { callback(c_str.as_ptr(), ctx as *mut c_void) };
                 }
-            });
-
-        runtime().block_on(handle.wait_for_ready());
-        let abort = handle.abort_handle();
-        let abort_arc = Arc::new(abort);
-        let abort_monitor = Arc::clone(&abort_arc);
-
-        // The upstream API lacks a close callback parameter, so we spawn a
-        // lightweight task that polls `is_finished` and fires `on_close`
-        // once the stream terminates (via `xmtp_stream_end` or fatal error).
-        runtime().spawn(async move {
-            loop {
-                if abort_monitor.is_finished() {
-                    invoke_on_close_ok(on_close, ctx, &g2);
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-        });
-
-        unsafe { write_out(out, FfiStreamHandle { abort: abort_arc }) }
+                Err(e) => invoke_on_close_err(on_close, ctx, &e.to_string(), &g1),
+            },
+            move || invoke_on_close_ok(on_close, ctx, &g2),
+        );
+        finalize_stream(handle, out)
     })
 }
 
@@ -460,12 +468,203 @@ pub unsafe extern "C" fn xmtp_stream_is_closed(handle: *const FfiStreamHandle) -
     }
 }
 
+/// Wait for the stream worker. Does not free the handle.
+///
+/// Takes the joinable task out of `handle`. Returns 0 if the worker finished
+/// (or was already joined). On timeout, leaks the remaining task so callbacks
+/// may still run; does not free.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xmtp_stream_join(handle: *mut FfiStreamHandle) -> i32 {
+    catch(|| {
+        let h = unsafe { mut_from(handle)? };
+        let Some(mut task) = take_join_task(h) else {
+            return Ok(());
+        };
+        if stream_join_timed_out(&mut task) {
+            leak_join_task(task);
+            return Err("stream join timed out".into());
+        }
+        Ok(())
+    })
+}
+
 /// Free a stream handle. Must be called after `xmtp_stream_end`.
 /// Calling this on an active (non-ended) stream will also end it.
+/// Does not wait. If join was skipped, the remaining task is leaked.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xmtp_stream_free(handle: *mut FfiStreamHandle) {
-    if !handle.is_null() {
-        let h = unsafe { Box::from_raw(handle) };
-        h.abort.end();
+    if handle.is_null() {
+        return;
+    }
+    let h = unsafe { Box::from_raw(handle) };
+    h.abort.end();
+    if let Some(task) = take_join_task(&h) {
+        leak_join_task(task);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Instant;
+
+    use xmtp_common::{AbortHandle, StreamHandle, StreamHandleError};
+
+    use super::*;
+
+    type Out = Result<(), xmtp_mls::subscriptions::SubscribeError>;
+
+    struct DummyAbort {
+        finished: bool,
+    }
+
+    impl AbortHandle for DummyAbort {
+        fn end(&self) {}
+        fn is_finished(&self) -> bool {
+            self.finished
+        }
+    }
+
+    struct SleepHandle {
+        delay: Duration,
+        done: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl StreamHandle for SleepHandle {
+        type StreamOutput = Out;
+        async fn wait_for_ready(&mut self) {}
+        fn end(&self) {}
+        async fn join(self) -> Result<Self::StreamOutput, StreamHandleError> {
+            tokio::time::sleep(self.delay).await;
+            self.done.store(true, Ordering::SeqCst);
+            Ok(Ok(()))
+        }
+        async fn end_and_wait(&mut self) -> Result<Self::StreamOutput, StreamHandleError> {
+            tokio::time::sleep(self.delay).await;
+            self.done.store(true, Ordering::SeqCst);
+            Ok(Ok(()))
+        }
+        fn abort_handle(&self) -> Box<dyn AbortHandle> {
+            Box::new(DummyAbort { finished: false })
+        }
+    }
+
+    struct HangHandle;
+
+    #[async_trait::async_trait]
+    impl StreamHandle for HangHandle {
+        type StreamOutput = Out;
+        async fn wait_for_ready(&mut self) {}
+        fn end(&self) {}
+        async fn join(self) -> Result<Self::StreamOutput, StreamHandleError> {
+            std::future::pending().await
+        }
+        async fn end_and_wait(&mut self) -> Result<Self::StreamOutput, StreamHandleError> {
+            std::future::pending().await
+        }
+        fn abort_handle(&self) -> Box<dyn AbortHandle> {
+            Box::new(DummyAbort { finished: false })
+        }
+    }
+
+    struct FlagThenHang {
+        flag: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl StreamHandle for FlagThenHang {
+        type StreamOutput = Out;
+        async fn wait_for_ready(&mut self) {}
+        fn end(&self) {}
+        async fn join(self) -> Result<Self::StreamOutput, StreamHandleError> {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            self.flag.store(true, Ordering::SeqCst);
+            std::future::pending().await
+        }
+        async fn end_and_wait(&mut self) -> Result<Self::StreamOutput, StreamHandleError> {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            self.flag.store(true, Ordering::SeqCst);
+            std::future::pending().await
+        }
+        fn abort_handle(&self) -> Box<dyn AbortHandle> {
+            Box::new(DummyAbort { finished: false })
+        }
+    }
+
+    fn wrap(task: FfiJoinHandle) -> *mut FfiStreamHandle {
+        into_raw(FfiStreamHandle {
+            abort: Arc::new(Box::new(DummyAbort { finished: false })),
+            join: Mutex::new(Some(task)),
+        })
+    }
+
+    #[test]
+    fn parse_conv_type_oneshot() {
+        assert_eq!(
+            parse_conv_type(3),
+            Some(xmtp_db::group::ConversationType::Oneshot)
+        );
+        assert_eq!(
+            parse_conv_type(0),
+            Some(xmtp_db::group::ConversationType::Dm)
+        );
+        assert!(parse_conv_type(99).is_none());
+    }
+
+    #[test]
+    fn stream_join_null_is_error() {
+        let rc = unsafe { xmtp_stream_join(std::ptr::null_mut()) };
+        assert_eq!(rc, -1);
+        assert!(xmtp_last_error_length() > 0);
+    }
+
+    #[test]
+    fn stream_join_already_taken_ok() {
+        let ptr = into_raw(FfiStreamHandle {
+            abort: Arc::new(Box::new(DummyAbort { finished: true })),
+            join: Mutex::new(None),
+        });
+        let rc = unsafe { xmtp_stream_join(ptr) };
+        assert_eq!(rc, 0);
+        unsafe { xmtp_stream_free(ptr) };
+    }
+
+    #[test]
+    fn stream_join_waits_for_callback() {
+        let done = Arc::new(AtomicBool::new(false));
+        let ptr = wrap(Box::new(SleepHandle {
+            delay: Duration::from_millis(50),
+            done: done.clone(),
+        }));
+        unsafe { xmtp_stream_end(ptr) };
+        let rc = unsafe { xmtp_stream_join(ptr) };
+        assert_eq!(rc, 0);
+        assert!(done.load(Ordering::SeqCst));
+        unsafe { xmtp_stream_free(ptr) };
+    }
+
+    #[test]
+    fn stream_join_timeout_leaks_and_callback_still_runs() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let ptr = wrap(Box::new(FlagThenHang { flag: flag.clone() }));
+        let rc = unsafe { xmtp_stream_join(ptr) };
+        assert_eq!(rc, -1);
+        assert!(xmtp_last_error_length() > 0);
+        let start = Instant::now();
+        while !flag.load(Ordering::SeqCst) && start.elapsed() < Duration::from_secs(1) {
+            std::thread::yield_now();
+        }
+        assert!(flag.load(Ordering::SeqCst));
+        unsafe { xmtp_stream_free(ptr) };
+    }
+
+    #[test]
+    fn stream_free_does_not_wait() {
+        let ptr = wrap(Box::new(HangHandle));
+        let start = Instant::now();
+        unsafe { xmtp_stream_free(ptr) };
+        assert!(start.elapsed() < Duration::from_millis(100));
     }
 }

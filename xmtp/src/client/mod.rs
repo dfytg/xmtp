@@ -80,6 +80,7 @@ pub fn libxmtp_version() -> Result<String> {
 pub struct Client {
     pub(crate) handle: OwnedHandle<xmtp_sys::XmtpFfiClient>,
     pub(crate) resolver: Option<Box<dyn crate::resolve::Resolver>>,
+    pub(crate) history_sync_url: String,
 }
 
 impl std::fmt::Debug for Client {
@@ -87,6 +88,7 @@ impl std::fmt::Debug for Client {
         f.debug_struct("Client")
             .field("handle", &self.handle)
             .field("resolver", &self.resolver.is_some())
+            .field("history_sync_url", &self.history_sync_url)
             .finish()
     }
 }
@@ -404,17 +406,60 @@ impl Client {
         Ok(read_key_package_status_list(out))
     }
 
-    /// Send a device sync request to retrieve records from another installation.
-    pub fn request_device_sync(&self) -> Result<()> {
-        let opts = xmtp_sys::XmtpFfiArchiveOptions::default();
-        // SAFETY: Valid handle; `opts` is a stack-allocated default struct.
+    /// History-sync server URL used by [`send_sync_request`](Self::send_sync_request).
+    #[must_use]
+    pub fn history_sync_url(&self) -> &str {
+        &self.history_sync_url
+    }
+}
+
+/// Gateway auth handle for d14n (`xmtp_auth_handle_*`).
+///
+/// Pass to [`ClientBuilder::auth_handle`]. Does not enable d14n by itself —
+/// [`ClientBuilder::gateway_host`] must also be set.
+#[derive(Debug)]
+pub struct AuthHandle {
+    handle: OwnedHandle<xmtp_sys::XmtpFfiAuthHandle>,
+}
+
+impl AuthHandle {
+    /// Create an empty gateway auth handle.
+    pub fn new() -> Result<Self> {
+        let mut out: *mut xmtp_sys::XmtpFfiAuthHandle = ptr::null_mut();
+        // SAFETY: `out` receives the new handle pointer.
+        error::check(unsafe { xmtp_sys::xmtp_auth_handle_create(&raw mut out) })?;
+        Ok(Self {
+            handle: OwnedHandle::new(out, xmtp_sys::xmtp_auth_handle_free)?,
+        })
+    }
+
+    /// Set a credential.
+    ///
+    /// `name` is an optional HTTP header name (`None` = `"authorization"`).
+    /// `expires_at_seconds` is the Unix expiry timestamp.
+    pub fn set(&self, name: Option<&str>, value: &str, expires_at_seconds: i64) -> Result<()> {
+        let c_name = name.map(to_c_string).transpose()?;
+        let c_value = to_c_string(value)?;
+        // SAFETY: handle and C strings are valid for the duration of the call.
         error::check(unsafe {
-            xmtp_sys::xmtp_device_sync_send_request(
+            xmtp_sys::xmtp_auth_handle_set(
                 self.handle.as_ptr(),
-                &raw const opts,
-                ptr::null(),
+                c_name.as_ref().map_or(ptr::null(), |c| c.as_ptr()),
+                c_value.as_ptr(),
+                expires_at_seconds,
             )
         })
+    }
+
+    /// Unique ID of this handle (0 if the pointer is invalid).
+    #[must_use]
+    pub fn id(&self) -> usize {
+        // SAFETY: `self.handle` is a valid FFI auth handle.
+        unsafe { xmtp_sys::xmtp_auth_handle_id(self.handle.as_ptr()) }
+    }
+
+    const fn as_ptr(&self) -> *const xmtp_sys::XmtpFfiAuthHandle {
+        self.handle.as_ptr()
     }
 }
 
@@ -427,6 +472,8 @@ pub struct ClientBuilder {
     app_version: Option<String>,
     api_url: Option<String>,
     gateway_host: Option<String>,
+    history_sync_url: Option<String>,
+    auth_handle: Option<AuthHandle>,
     nonce: u64,
     disable_device_sync: bool,
     allow_offline: bool,
@@ -460,10 +507,19 @@ impl ClientBuilder {
     }
 
     /// Set a 32-byte encryption key for the local database.
-    #[must_use]
-    pub fn encryption_key(mut self, k: Vec<u8>) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::XmtpError::InvalidArgument`] if `k` is not exactly 32 bytes.
+    pub fn encryption_key(mut self, k: impl Into<Vec<u8>>) -> Result<Self> {
+        let k = k.into();
+        if k.len() != 32 {
+            return Err(error::XmtpError::InvalidArgument(
+                "encryption key must be 32 bytes".into(),
+            ));
+        }
         self.encryption_key = Some(k);
-        self
+        Ok(self)
     }
 
     /// Override the API URL (instead of deriving from `env`).
@@ -474,10 +530,37 @@ impl ClientBuilder {
     }
 
     /// Set the gateway host URL for decentralized API.
+    ///
+    /// Does not default from [`Env::gateway_url`](crate::Env::gateway_url);
+    /// d14n stays off unless this is set.
     #[must_use]
     pub fn gateway_host(mut self, h: impl Into<String>) -> Self {
         self.gateway_host = Some(h.into());
         self
+    }
+
+    /// Override the history-sync server URL (instead of [`Env::history_sync_url`]).
+    ///
+    /// Stored on the client for [`Client::send_sync_request`]. Does **not** send
+    /// a sync request on [`build`](Self::build).
+    #[must_use]
+    pub fn history_sync_url(mut self, u: impl Into<String>) -> Self {
+        self.history_sync_url = Some(u.into());
+        self
+    }
+
+    /// Attach a gateway [`AuthHandle`]. Requires [`gateway_host`](Self::gateway_host).
+    #[must_use]
+    pub fn auth_handle(mut self, handle: AuthHandle) -> Self {
+        self.auth_handle = Some(handle);
+        self
+    }
+
+    /// History-sync URL that will be stored on the client at build time.
+    fn resolved_history_sync_url(&self) -> &str {
+        self.history_sync_url
+            .as_deref()
+            .unwrap_or_else(|| self.env.history_sync_url())
     }
 
     /// Set a custom app version string.
@@ -558,6 +641,14 @@ impl ClientBuilder {
         let c_inbox = to_c_string(&inbox_id)?;
         let c_app = self.app_version.as_deref().map(to_c_string).transpose()?;
 
+        if let Some(ref key) = self.encryption_key
+            && key.len() != 32
+        {
+            return Err(error::XmtpError::InvalidArgument(
+                "encryption key must be 32 bytes".into(),
+            ));
+        }
+
         let opts = xmtp_sys::XmtpFfiClientOptions {
             host: c_host.as_ptr(),
             gateway_host: c_gateway.as_ref().map_or(ptr::null(), |c| c.as_ptr()),
@@ -571,22 +662,28 @@ impl ClientBuilder {
             account_identifier: c_account.as_ptr(),
             identifier_kind: kind as i32,
             nonce,
-            auth_handle: ptr::null(),
+            auth_handle: self
+                .auth_handle
+                .as_ref()
+                .map_or(ptr::null(), AuthHandle::as_ptr),
             app_version: c_app.as_ref().map_or(ptr::null(), |c| c.as_ptr()),
             device_sync_worker_mode: i32::from(self.disable_device_sync),
             allow_offline: i32::from(self.allow_offline),
             client_mode: i32::from(self.notification_mode),
             max_db_pool_size: 0,
             min_db_pool_size: 0,
+            encryption_key_len: if self.encryption_key.is_some() { 32 } else { 0 },
         };
 
         let mut raw: *mut xmtp_sys::XmtpFfiClient = ptr::null_mut();
         // SAFETY: `opts` is a fully initialized struct with valid CString pointers that outlive this call.
         error::check(unsafe { xmtp_sys::xmtp_client_create(&raw const opts, &raw mut raw) })?;
         let handle = OwnedHandle::new(raw, xmtp_sys::xmtp_client_free)?;
+        let history_sync_url = self.resolved_history_sync_url().to_owned();
         Ok(Client {
             handle,
             resolver: self.resolver,
+            history_sync_url,
         })
     }
 }
@@ -802,4 +899,74 @@ fn read_inbox_state_list(ptr: *mut xmtp_sys::XmtpFfiInboxStateList) -> Result<Ve
         });
     }
     Ok(states)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encryption_key_rejects_non_32_byte() {
+        assert!(
+            ClientBuilder::default()
+                .encryption_key(vec![0u8; 16])
+                .is_err()
+        );
+        assert!(
+            ClientBuilder::default()
+                .encryption_key(vec![0u8; 0])
+                .is_err()
+        );
+        assert!(
+            ClientBuilder::default()
+                .encryption_key(vec![0u8; 64])
+                .is_err()
+        );
+        assert!(matches!(
+            ClientBuilder::default().encryption_key(vec![0u8; 16]),
+            Err(error::XmtpError::InvalidArgument(_))
+        ));
+        assert!(
+            ClientBuilder::default()
+                .encryption_key(vec![0u8; 32])
+                .is_ok()
+        );
+        assert!(ClientBuilder::default().encryption_key([0u8; 32]).is_ok());
+    }
+
+    #[test]
+    fn history_sync_url_defaults_from_env_and_accepts_override() {
+        assert_eq!(
+            ClientBuilder::default().resolved_history_sync_url(),
+            Env::Dev.history_sync_url()
+        );
+        assert_eq!(
+            ClientBuilder::default()
+                .env(Env::Local)
+                .resolved_history_sync_url(),
+            Env::Local.history_sync_url()
+        );
+        assert_eq!(
+            ClientBuilder::default()
+                .env(Env::Production)
+                .resolved_history_sync_url(),
+            Env::Production.history_sync_url()
+        );
+        assert_eq!(
+            ClientBuilder::default()
+                .env(Env::Production)
+                .history_sync_url("http://override.example")
+                .resolved_history_sync_url(),
+            "http://override.example"
+        );
+    }
+
+    #[test]
+    fn request_device_sync_is_removed() {
+        // Replacement is Client::send_sync_request / send_sync_request_to.
+        // The method itself is deleted (no alias).
+        let _: fn(&Client, crate::ArchiveOptions) -> Result<()> = Client::send_sync_request;
+        let _: fn(&Client, &str, crate::ArchiveOptions) -> Result<()> =
+            Client::send_sync_request_to;
+    }
 }

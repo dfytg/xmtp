@@ -18,6 +18,10 @@ pub(crate) fn info(profile: &str, json: bool) -> xmtp::Result<()> {
         .flat_map(|s| s.installation_ids.iter().map(String::as_str))
         .collect();
 
+    let dir = config::profile_dir(profile);
+    let db_path = dir.join("messages.db3");
+    let db_key_path = dir.join("db.key");
+
     if json {
         let installations: Vec<serde_json::Value> = ids
             .iter()
@@ -36,6 +40,8 @@ pub(crate) fn info(profile: &str, json: bool) -> xmtp::Result<()> {
                 "address": cfg.address,
                 "inbox_id": inbox_id,
                 "signer": cfg.signer.to_string(),
+                "database": db_path.display().to_string(),
+                "db_key": db_key_path.display().to_string(),
                 "installations": installations,
             })
         );
@@ -49,17 +55,15 @@ pub(crate) fn info(profile: &str, json: bool) -> xmtp::Result<()> {
     println!("Inbox ID:      {inbox_id}");
     match cfg.signer {
         SignerKind::File => {
-            let key = config::profile_dir(profile).join("identity.key");
+            let key = dir.join("identity.key");
             println!("Signer:        key file ({})", key.display());
         }
         SignerKind::Ledger(i) => {
             println!("Signer:        Ledger (index {i})");
         }
     }
-    println!(
-        "Database:      {}",
-        config::profile_dir(profile).join("messages.db3").display()
-    );
+    println!("Database:      {}", db_path.display());
+    println!("DB key:        {}", db_key_path.display());
 
     println!("\nInstallations ({} / 10):\n", ids.len());
     for (i, id) in ids.iter().enumerate() {

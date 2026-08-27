@@ -189,6 +189,8 @@ pub struct XmtpFfiClientOptions {
     pub max_db_pool_size: u32,
     #[doc = " Minimum database connection pool size. 0 = use default."]
     pub min_db_pool_size: u32,
+    #[doc = " Byte length of `encryption_key`. 0 if `encryption_key` is null, else 32."]
+    pub encryption_key_len: i32,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
@@ -226,6 +228,8 @@ const _: () = {
         [::core::mem::offset_of!(XmtpFfiClientOptions, max_db_pool_size) - 100usize];
     ["Offset of field: XmtpFfiClientOptions::min_db_pool_size"]
         [::core::mem::offset_of!(XmtpFfiClientOptions, min_db_pool_size) - 104usize];
+    ["Offset of field: XmtpFfiClientOptions::encryption_key_len"]
+        [::core::mem::offset_of!(XmtpFfiClientOptions, encryption_key_len) - 108usize];
 };
 impl Default for XmtpFfiClientOptions {
     fn default() -> Self {
@@ -1038,6 +1042,10 @@ unsafe extern "C" {
 unsafe extern "C" {
     #[doc = " Copy the last error message into `buf`. Returns bytes written (excluding NUL),\n or -1 if `buf` is null or too small."]
     pub fn xmtp_last_error_message(buf: *mut ::core::ffi::c_char, buf_len: i32) -> i32;
+}
+unsafe extern "C" {
+    #[doc = " Drop the process-global tokio runtime (cdylib unload). Further FFI calls recreate it."]
+    pub fn xmtp_shutdown();
 }
 unsafe extern "C" {
     #[doc = " Free a string previously returned by this library."]
@@ -2027,7 +2035,7 @@ unsafe extern "C" {
     pub fn xmtp_available_archive_list_free(list: *mut XmtpFfiAvailableArchiveList);
 }
 unsafe extern "C" {
-    #[doc = " Export an archive to a local file.\n `key` must be at least 32 bytes (encryption key)."]
+    #[doc = " Export an archive to a local file.\n `key` must be exactly 32 bytes (encryption key)."]
     pub fn xmtp_device_sync_create_archive(
         client: *const XmtpFfiClient,
         path: *const ::core::ffi::c_char,
@@ -2037,7 +2045,7 @@ unsafe extern "C" {
     ) -> i32;
 }
 unsafe extern "C" {
-    #[doc = " Import a previously exported archive from a file.\n `key` must be at least 32 bytes (encryption key)."]
+    #[doc = " Import a previously exported archive from a file.\n `key` must be exactly 32 bytes (encryption key)."]
     pub fn xmtp_device_sync_import_archive(
         client: *const XmtpFfiClient,
         path: *const ::core::ffi::c_char,
@@ -2225,7 +2233,7 @@ unsafe extern "C" {
     ) -> i32;
 }
 unsafe extern "C" {
-    #[doc = " Stream new conversations. Callback receives owned `*mut FfiConversation` (caller must free).\n `on_close(error, ctx)`: null error = normal close; non-null = borrowed error string.\n Caller must end with `xmtp_stream_end` and free with `xmtp_stream_free`."]
+    #[doc = " Stream new conversations. Callback receives owned `*mut FfiConversation` (caller must free).\n `on_close(error, ctx)`: null error = normal close; non-null = borrowed error string.\n Caller must `xmtp_stream_end`, `xmtp_stream_join`, then `xmtp_stream_free`."]
     pub fn xmtp_stream_conversations(
         client: *const XmtpFfiClient,
         conversation_type: i32,
@@ -2289,7 +2297,7 @@ unsafe extern "C" {
     ) -> i32;
 }
 unsafe extern "C" {
-    #[doc = " Stream message deletion events. Callback receives a borrowed hex message ID\n (`*const c_char`) — valid only during the callback invocation.\n Now includes `on_close` for API consistency with other stream functions."]
+    #[doc = " Stream message deletion events. Callback receives a borrowed hex message ID\n (`*const c_char`) — valid only during the callback invocation."]
     pub fn xmtp_stream_message_deletions(
         client: *const XmtpFfiClient,
         callback: XmtpFnMessageDeletionCallback,
@@ -2309,6 +2317,10 @@ unsafe extern "C" {
     pub fn xmtp_stream_is_closed(handle: *const XmtpFfiStreamHandle) -> i32;
 }
 unsafe extern "C" {
-    #[doc = " Free a stream handle. Must be called after `xmtp_stream_end`.\n Calling this on an active (non-ended) stream will also end it."]
+    #[doc = " Wait for the stream worker. Does not free the handle.\n\n Takes the joinable task out of `handle`. Returns 0 if the worker finished\n (or was already joined). On timeout, leaks the remaining task so callbacks\n may still run; does not free."]
+    pub fn xmtp_stream_join(handle: *mut XmtpFfiStreamHandle) -> i32;
+}
+unsafe extern "C" {
+    #[doc = " Free a stream handle. Must be called after `xmtp_stream_end`.\n Calling this on an active (non-ended) stream will also end it.\n Does not wait. If join was skipped, the remaining task is leaked."]
     pub fn xmtp_stream_free(handle: *mut XmtpFfiStreamHandle);
 }
