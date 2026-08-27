@@ -92,7 +92,7 @@ jobs:
       - name: cargo deny (workspace + xmtp-ffi)
         run: |
           cargo deny --manifest-path xmtp-sys/Cargo.toml check
-          cargo deny --manifest-path xmtp-ffi/Cargo.toml check --config xmtp-ffi/deny.toml
+          cargo deny --manifest-path xmtp-ffi/Cargo.toml check
 
   bindings:
     name: bindings dirty

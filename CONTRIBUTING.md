@@ -167,7 +167,7 @@ make pre-commit     # fmt + clippy + test + build + changelog
 - RAII `OwnedHandle<T>` wraps every FFI pointer — calls `free` on drop.
 - `error::check(rc)` converts FFI return codes to `Result`.
 - `ffi::take_c_string()` takes ownership of C strings and frees them.
-- All FFI calls are in `ffi.rs`, `stream.rs`, `client/`, or `conversation.rs` — no raw FFI elsewhere.
+- All FFI calls are in `ffi.rs`, `stream.rs`, `client/`, `conversation.rs`, or `archive.rs` — no raw FFI elsewhere.
 
 ### CLI Conventions (xmtp-cli)
 
